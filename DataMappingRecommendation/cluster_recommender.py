@@ -1,10 +1,3 @@
-"""Cluster-conditioned denoising autoencoder for sparse explicit ratings.
-
-Inputs are item embeddings and observed ratings, not a dense user-item matrix.
-The model encodes a set of ratings from one user/cluster and reconstructs ratings
-for masked items in that cluster. Content features also permit unrated food items
-to be scored without learned item-ID parameters.
-"""
 
 from dataclasses import dataclass
 
