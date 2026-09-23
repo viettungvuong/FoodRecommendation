@@ -303,6 +303,18 @@ class RecipeEncoderTests(unittest.TestCase):
         np.testing.assert_array_equal(accelerated[2], np.zeros(768))
         self.assertTrue(all(not parameter.requires_grad for parameter in model.parameters()))
 
+    def test_balanced_rating_class_weights_match_scikit_learn(self):
+        # Ratings 5 x6, 4 x3 and 1 x1, scaled to 0..1 as RatingGroup stores them.
+        groups = [SimpleNamespace(ratings=(np.array([5.0] * 6 + [4.0] * 3) - 1) / 4),
+                  SimpleNamespace(ratings=np.array([0.0]))]
+        counts, weights = build_rating_class_weights(groups)
+        np.testing.assert_array_equal(counts, [1, 0, 0, 3, 6])
+        # n_samples / (n_present_classes * count); absent ratings 2 and 3 get the rarest weight.
+        np.testing.assert_allclose(weights, [10 / 3, 10 / 3, 10 / 3, 10 / 9, 10 / 18], rtol=1e-6)
+        np.testing.assert_array_equal(build_rating_class_weights(groups, class_weight=None)[1], np.ones(5))
+        with self.assertRaises(ValueError):
+            build_rating_class_weights(groups, class_weight="sqrt")
+
     def test_notebook_pipeline_through_clustering_training_prediction_and_save(self):
         from scipy import sparse
         from sklearn.cluster import HDBSCAN
@@ -382,7 +394,7 @@ class RecipeEncoderTests(unittest.TestCase):
                          MODEL_NAME="bert-base-uncased", MAX_LENGTH=512, ENCODER_IDENTITY=identity,
                          ENCODER_WEIGHTS_PATH=encoder_path, FEATURE_FORMAT_VERSION=FEATURE_FORMAT_VERSION,
                          recommendation_model=autoencoder, LATENT_DIM=4, RATING_MIN=1, RATING_MAX=5,
-                         NUM_RATING_CLASSES=5, FOCAL_GAMMA=2.0, CLASS_WEIGHT_POWER=0.5,
+                         NUM_RATING_CLASSES=5, FOCAL_GAMMA=2.0, CLASS_WEIGHT="balanced",
                          rating_class_weights=build_rating_class_weights(training)[1],
                          DOMINANT_RATING=5.0, HEAVY_USER_MIN_RATINGS=50,
                          MAX_DOMINANT_TO_OTHER_RATIO=2.0, MIN_DOMINANT_KEEP=10,
@@ -397,6 +409,7 @@ class RecipeEncoderTests(unittest.TestCase):
                 self.assertEqual(set(handle["state_dict"]), set(autoencoder.state_dict()))
                 self.assertEqual(handle.attrs["feature_format_version"], FEATURE_FORMAT_VERSION)
                 self.assertEqual(handle.attrs["encoder_artifact"], encoder_path.name)
+                self.assertEqual(handle.attrs["class_weight"], "balanced")
 
 
 if __name__ == "__main__":

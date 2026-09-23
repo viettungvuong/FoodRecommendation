@@ -2,6 +2,7 @@
 
 Run with: python3 -m unittest discover -s DataMappingRecommendation/tests -v
 """
+import ast
 import contextlib
 import io
 import json
@@ -65,6 +66,21 @@ class TwoTowerNotebookTests(unittest.TestCase):
             ["v", "3", 1, "2024-01-02"], ["v", "4", 5, "2024-01-04"],
         ], columns=["user_id", "recipe_id", "rating", "date"])
         return catalog, self.call("build_interactions", frame, catalog), np.eye(5, dtype=np.float32)
+
+    def test_later_cells_do_not_rebind_core_or_feature_definitions(self):
+        # Every cell shares one namespace, so e.g. a table variable named like a helper breaks it.
+        definition_tags = {"two-tower-core", "two-tower-features"}
+        definitions = set()
+        for cell in self.notebook["cells"]:
+            if definition_tags & set(cell.get("metadata", {}).get("tags", [])):
+                definitions |= {node.name for node in ast.parse("".join(cell["source"])).body
+                                if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+        for cell in self.notebook["cells"]:
+            if cell["cell_type"] != "code" or definition_tags & set(cell.get("metadata", {}).get("tags", [])):
+                continue
+            assigned = {node.id for node in ast.walk(ast.parse("".join(cell["source"])))
+                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+            self.assertFalse(assigned & definitions, f"cell {cell['id']} rebinds {sorted(assigned & definitions)}")
 
     def test_nested_prices_sum_known_leaves_and_accumulate_missing_error(self):
         result = self.call("summarize_price",
@@ -205,8 +221,14 @@ class TwoTowerNotebookTests(unittest.TestCase):
             model.history_attention.weight.zero_()
             model.history_attention.bias.zero_()
         weights = model.history_weights(torch.randn(1, 3, 8), torch.tensor([[11.0, 1.0, 0.0]]),
-                                        torch.tensor([[True, True, False]]))
+                                        torch.tensor([[4, 4, 0]]), torch.tensor([[True, True, False]]))
         torch.testing.assert_close(weights, torch.tensor([[1 / 3, 2 / 3, 0.0]]))
+        # Same age: a neutral rating (3) starts at half a positive one's weight; negative counts fully.
+        same_age, both = torch.zeros(1, 2), torch.tensor([[True, True]])
+        torch.testing.assert_close(model.history_weights(torch.randn(1, 2, 8), same_age, torch.tensor([[2, 4]]), both),
+                                   torch.tensor([[1 / 3, 2 / 3]]))
+        torch.testing.assert_close(model.history_weights(torch.randn(1, 2, 8), same_age, torch.tensor([[0, 4]]), both),
+                                   torch.tensor([[0.5, 0.5]]))
 
     def test_user_id_gru_item_towers_and_cut_points_receive_weighted_cross_entropy_gradients(self):
         torch.manual_seed(9)
@@ -277,10 +299,65 @@ class TwoTowerNotebookTests(unittest.TestCase):
     def test_serving_now_hides_recipes_rated_earlier_today(self):
         catalog, _, features = self.interaction_fixture()
         today = pd.DataFrame({"user_id": ["u"], "item_index": [2], "rating": [5.0],
-                              "date": [pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=1)]})
+                              "date": [pd.Timestamp.now(tz="UTC") - pd.Timedelta(1, unit="s")]})
         model = self.call("TwoTowerModel", 5, 1, embedding_dim=4, hidden_dim=8)
         result = self.call("recommend_recipes", model, catalog, features, today, "u", top_k=10)
         self.assertEqual(sorted(result.recipe_id), ["1", "2", "4", "5"])
+
+    def test_level_column_marks_negative_neutral_and_positive_ratings(self):
+        catalog = pd.DataFrame({"recipe_id": [str(i) for i in range(1, 6)]})
+        frame = pd.DataFrame({"recipe_id": range(1, 6), "user_id": 7, "rating": [1, 2, 3, 4, 5],
+                              "date": "2024-01-01"})
+        result = self.call("build_interactions", frame, catalog).sort_values("rating")
+        self.assertEqual(result.level.tolist(), ["negative", "negative", "neutral", "positive", "positive"])
+        np.testing.assert_array_equal(self.call("rating_to_level", [1, 2, 3, 4, 5]), [0, 0, 1, 2, 2])
+
+    def test_contrast_pairs_positive_and_negative_recipes_of_the_same_user(self):
+        ratings = pd.DataFrame({"user_id": ["u", "u", "u", "u", "v"], "item_index": [0, 1, 2, 3, 4],
+                                "rating": [5.0, 4.0, 1.0, 3.0, 5.0],
+                                "date": pd.to_datetime(["2024-01-02"] * 5, utc=True)})
+        dataset = self.call("HistoryDataset", ratings, ratings, training=False, seed=0)
+        samples = [dataset[index] for index in range(len(dataset))]
+        # u's positives pair with its only negative (+1); the negative pairs with a positive (-1).
+        self.assertEqual([(s["contrast_item_index"], float(s["contrast_sign"])) for s in samples[:2]],
+                         [(2, 1.0), (2, 1.0)])
+        self.assertIn(samples[2]["contrast_item_index"], {0, 1})
+        self.assertEqual(float(samples[2]["contrast_sign"]), -1.0)
+        # A neutral target, and a user with only positive ratings, have no pair.
+        self.assertEqual([float(s["contrast_sign"]) for s in samples[3:]], [0.0, 0.0])
+        np.testing.assert_array_equal(dataset.has_contrast, [True, True, True, False, False])
+        self.assertEqual(dataset[2]["contrast_item_index"], samples[2]["contrast_item_index"])  # Fixed in validation.
+        # An empty pool draws no pairs, so only the target is hidden (the reranker relies on this).
+        unpaired = self.call("HistoryDataset", ratings, ratings, training=False, contrast_pool=ratings.iloc[:0])
+        self.assertFalse(unpaired.has_contrast.any())
+        self.assertEqual(float(unpaired[0]["contrast_sign"]), 0.0)
+
+    def test_training_pairs_hide_both_recipes_from_the_history(self):
+        ratings = pd.DataFrame({"user_id": ["u"] * 3, "item_index": [0, 1, 2], "rating": [1.0, 3.0, 5.0],
+                                "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-05"], utc=True)})
+        dataset = self.call("HistoryDataset", ratings, ratings, contrast_pool=ratings)
+        sample = dataset[2]  # Positive recipe 2; its only negative, recipe 0, was rated earlier.
+        self.assertEqual((sample["contrast_item_index"], float(sample["contrast_sign"])), (0, 1.0))
+        self.assertEqual(sample["history_items"][sample["history_mask"]].tolist(), [1])
+        # One spare row per excluded recipe keeps max_history real ratings.
+        index = self.call("HistoryIndex", ratings)
+        np.testing.assert_array_equal(
+            self.call("user_history", index, "u", "2024-01-06", max_history=1, exclude_item=[2, 1])[0], [0])
+
+    def test_ranking_loss_is_small_when_the_positive_recipe_outscores_the_negative(self):
+        model = self.call("TwoTowerModel", 2, 1, embedding_dim=2, hidden_dim=4)
+        model.encode_items = lambda features: features  # Item vectors equal their features here.
+        features = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        users = torch.tensor([[1.0, 0.1], [1.0, 0.1]])  # Prefers recipe 0.
+        # Row 0: positive recipe 0 against negative recipe 1; row 1: negative recipe 1 against positive 0.
+        batch = {"contrast_sign": torch.tensor([1.0, -1.0]), "contrast_item_index": torch.tensor([1, 0])}
+        losses, margins, rows = self.call("ranking_losses", model, users, features, batch, features)
+        self.assertTrue(torch.all(margins > 0))
+        torch.testing.assert_close(margins[0], margins[1])
+        swapped, _, _ = self.call("ranking_losses", model, users[:, [1, 0]], features, batch, features)
+        self.assertTrue(torch.all(swapped > losses))
+        unpaired = {"contrast_sign": torch.zeros(2), "contrast_item_index": torch.zeros(2, dtype=torch.long)}
+        self.assertEqual(len(self.call("ranking_losses", model, users, features, unpaired, features)[2]), 0)
 
     def test_ordinal_head_gives_valid_probabilities_and_monotone_expected_rating(self):
         torch.manual_seed(3)
@@ -334,18 +411,19 @@ class TwoTowerNotebookTests(unittest.TestCase):
         catalog, interactions, features = self.interaction_fixture()
         train, validation = self.call("stratified_split", interactions, validation_fraction=0.5, seed=0)
         lookup = self.call("build_user_lookup", train)
-        train_dataset = self.call("HistoryDataset", train, train, lookup)
-        validation_dataset = self.call("HistoryDataset", validation, train, lookup, training=False)
+        train_dataset = self.call("HistoryDataset", train, train, lookup, contrast_pool=interactions)
+        validation_dataset = self.call("HistoryDataset", validation, train, lookup, training=False,
+                                       contrast_pool=interactions)
         model = self.call("TwoTowerModel", 5, len(lookup), embedding_dim=4, hidden_dim=8)
         initial = {name: value.detach().clone() for name, value in model.named_parameters()}
         with contextlib.redirect_stdout(io.StringIO()):
             model, history, metrics = self.call("train_two_tower", model, train_dataset,
                 validation_dataset, features, epochs=3, batch_size=2, device="cpu")
         self.assertTrue(np.isfinite(history[["train_cross_entropy", "train_in_batch_cross_entropy",
-                                             "validation_total_loss"]]).all().all())
+                                             "train_ranking_loss", "validation_total_loss"]]).all().all())
         self.assertTrue(np.isfinite(list(metrics.values())).all())
         self.assertEqual(set(metrics), {"rmse", "mae", "macro_mae", "balanced_accuracy", "cross_entropy",
-                                        "in_batch_cross_entropy"})
+                                        "in_batch_cross_entropy", "ranking_loss", "pairwise_accuracy"})
         report = self.call("rating_class_report",
                            *self.call("predict_ratings", model, validation_dataset, features))
         self.assertEqual(report.index.tolist(), [1, 2, 3, 4, 5])
@@ -390,6 +468,7 @@ class TwoTowerNotebookTests(unittest.TestCase):
                 MISSING_PRICE_ERROR_DOLLARS=2, RANDOM_STATE=13, VALIDATION_FRACTION=0.2,
                 CLASS_WEIGHT="balanced", training_class_weights=np.ones(5, np.float32),
                 IN_BATCH_WEIGHT=0.5, IN_BATCH_TEMPERATURE=0.05, IN_BATCH_MIN_RATING=4,
+                NEUTRAL_HISTORY_WEIGHT=0.5, RANKING_WEIGHT=0.5, RANKING_TEMPERATURE=0.05,
                 MAX_FIVE_STAR_TARGETS_PER_USER=20, MAX_FIVE_TO_OTHER_RATIO=2.0,
                 DATA_PATH=Path("fixture.csv"), training_history=pd.DataFrame({"epoch": [1]}),
                 user_lookup=lookup)
@@ -417,6 +496,8 @@ class TwoTowerNotebookTests(unittest.TestCase):
                              ("class_weighted_cross_entropy", "stratified_random", "cosine"))
             self.assertEqual((config["retrieval_loss"], config["in_batch_weight"]),
                              ("in_batch_sampled_softmax_logq", 0.5))
+            self.assertEqual((config["format_version"], config["ranking_loss"], config["model_config"]["neutral_weight"]),
+                             ("recipe_two_tower_v4", "per_user_positive_over_negative_logistic", 0.5))
 
 
 if __name__ == "__main__":
