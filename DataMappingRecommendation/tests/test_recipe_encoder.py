@@ -305,8 +305,7 @@ class RecipeEncoderTests(unittest.TestCase):
 
     def test_notebook_pipeline_through_clustering_training_prediction_and_save(self):
         from scipy import sparse
-        from sklearn.cluster import DBSCAN
-        from sklearn.neighbors import NearestNeighbors, sort_graph_by_row_values
+        from sklearn.cluster import HDBSCAN
         from sklearn.preprocessing import normalize
         from umap import UMAP
 
@@ -329,24 +328,30 @@ class RecipeEncoderTests(unittest.TestCase):
         notebook = json.loads((Path(__file__).resolve().parents[1] / "model_training.ipynb").read_text())
         sources = [''.join(cell['source']) for cell in notebook['cells'] if cell['cell_type'] == 'code']
         scope = dict(
-            np=np, pd=pd, torch=torch, sparse=sparse, normalize=normalize, UMAP=UMAP,
-            DBSCAN=DBSCAN, NearestNeighbors=NearestNeighbors, sort_graph_by_row_values=sort_graph_by_row_values,
+            np=np, pd=pd, torch=torch, sparse=sparse, normalize=normalize, UMAP=UMAP, HDBSCAN=HDBSCAN,
             encode_feature_table=encode_feature_table, recipe_encoder=model, term_embeddings=embedding,
             term_feature_table=table, datasets=datasets, row_embedding_ids=table.row_embedding_ids,
             row_counts=table.row_counts, device="cpu", FEATURE_COLUMNS=FEATURE_COLUMNS,
             ENCODER_BATCH_SIZE=4, UMAP_COMPONENTS=2, UMAP_NEIGHBORS=3, UMAP_MIN_DIST=0,
-            RANDOM_STATE=42, EPS=1e6, MIN_SAMPLES=2, GRAPH_BATCH_SIZE=3, MAX_GRAPH_EDGES=1000,
+            RANDOM_STATE=42, MIN_CLUSTER_SIZE=2, MIN_SAMPLES=1, CLUSTER_SELECTION_EPSILON=0.0,
+            CLUSTER_SELECTION_METHOD="eom", HDBSCAN_N_JOBS=1,
             display=lambda *args: None,
         )
         for prefix in ("contextual_field_embeddings,", "valid_embedding_ids =",
-                       "def cluster_weighted_embeddings(", "def average_cluster_embeddings("):
+                       "def cluster_contextualized_embeddings(", "def average_cluster_embeddings("):
             source = next(source for source in sources if source.startswith(prefix))
             with contextlib.redirect_stdout(io.StringIO()):
                 exec(compile(source, "notebook-integration", "exec"), scope)
         features = scope["contextualized_embeddings"]
         self.assertIs(features, scope["weighted_embeddings"])
         self.assertTrue(np.isfinite(scope["reduced_embeddings"]).all())
-        self.assertTrue((recipe["cluster"] == 0).all())
+        # Each row inherits its feature combination's HDBSCAN label, and cluster means count every row.
+        row_labels = np.concatenate([df["cluster"].to_numpy() for df in datasets.values()])
+        np.testing.assert_array_equal(row_labels, scope["unique_cluster_labels"][table.row_embedding_ids])
+        self.assertGreater((row_labels >= 0).sum(), 0)
+        expected_sizes = pd.Series(row_labels[row_labels >= 0]).value_counts().sort_index()
+        np.testing.assert_array_equal(scope["cluster_embeddings_df"]["row_count"].to_numpy(),
+                                      expected_sizes.to_numpy())
         catalog, ratings = build_catalog_and_ratings(recipe, food)
         self.assertEqual(len(ratings), 5)  # Unrated recipe/foods never become zero targets.
         training, validation = split_rating_groups(ratings)
@@ -377,12 +382,19 @@ class RecipeEncoderTests(unittest.TestCase):
                          MODEL_NAME="bert-base-uncased", MAX_LENGTH=512, ENCODER_IDENTITY=identity,
                          ENCODER_WEIGHTS_PATH=encoder_path, FEATURE_FORMAT_VERSION=FEATURE_FORMAT_VERSION,
                          recommendation_model=autoencoder, LATENT_DIM=4, RATING_MIN=1, RATING_MAX=5,
+                         NUM_RATING_CLASSES=5, FOCAL_GAMMA=2.0, CLASS_WEIGHT_POWER=0.5,
+                         rating_class_weights=build_rating_class_weights(training)[1],
+                         DOMINANT_RATING=5.0, HEAVY_USER_MIN_RATINGS=50,
+                         MAX_DOMINANT_TO_OTHER_RATIO=2.0, MIN_DOMINANT_KEEP=10,
                          Path=lambda value: Path(directory) / value)
             save_cell = next(source for source in sources if source.startswith("# Save recommender weights"))
             with contextlib.redirect_stdout(io.StringIO()):
                 exec(compile(save_cell, "notebook-save", "exec"), scope)
-            with h5py.File(output / "cluster_denoising_autoencoder.h5") as handle:
+            with h5py.File(output / "recipe_recommender_autoencoder.h5") as handle:
                 self.assertEqual(handle.attrs["encoder_identity"], identity)
+                self.assertEqual(handle.attrs["clustering_algorithm"], "HDBSCAN")
+                self.assertEqual(handle.attrs["num_rating_classes"], autoencoder.num_rating_classes)
+                self.assertEqual(set(handle["state_dict"]), set(autoencoder.state_dict()))
                 self.assertEqual(handle.attrs["feature_format_version"], FEATURE_FORMAT_VERSION)
                 self.assertEqual(handle.attrs["encoder_artifact"], encoder_path.name)
 

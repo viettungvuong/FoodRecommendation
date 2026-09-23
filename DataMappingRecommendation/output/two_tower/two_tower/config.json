@@ -1,0 +1,19 @@
+{
+  "format_version": "recipe_two_tower_v1",
+  "model_config": {
+    "feature_dim": 444,
+    "user_feature_dim": 891,
+    "embedding_dim": 64,
+    "hidden_dim": 128
+  },
+  "bert_model": "bert-base-uncased",
+  "bert_revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+  "recency_half_life_days": 180.0,
+  "max_history": 64,
+  "missing_price_error_dollars": 2.0,
+  "random_state": 42,
+  "validation_fraction": 0.2,
+  "source_csv": "/Users/tung/Desktop/Ho\u0323c/Projects/ProjectSem1_2/DataMappingRecommendation/input_stage2/recipe_user_ratings.csv",
+  "rating_min": 1.0,
+  "rating_max": 5.0
+}
