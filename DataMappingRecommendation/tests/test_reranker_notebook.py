@@ -205,15 +205,45 @@ class RerankerNotebookTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.n("predict_rating_probabilities")(booster, features.drop(columns="bias_baseline"))
 
-    def test_balanced_class_weight_matches_the_two_tower_weights(self):
-        features, ratings = self.synthetic_features()
-        for option in (None, "balanced"):
-            _, _, weights = self.n("train_reranker")(
-                features[:400], ratings[:400], features[400:], ratings[400:],
-                params={"min_data_in_leaf": 5, "num_leaves": 4}, class_weight=option,
-                num_boost_round=5, early_stopping_rounds=5, log_period=0)
-            np.testing.assert_allclose(weights, self.n("rating_class_weights")(ratings[:400], class_weight=option))
-        self.assertTrue((weights != 1).any())
+    def test_balanced_class_weights_follow_scikit_learn(self):
+        from sklearn.utils.class_weight import compute_class_weight
+
+        ratings = np.array([1.0, 2, 3, 4, 4, 5, 5, 5, 5, 5])
+        np.testing.assert_allclose(self.n("balanced_class_weights")(ratings),
+                                   compute_class_weight("balanced", classes=np.arange(1, 6), y=ratings))
+        np.testing.assert_allclose(self.n("balanced_class_weights")(ratings), 10 / (5 * np.array([1, 1, 1, 2, 5])))
+        missing_two = self.n("balanced_class_weights")([1.0, 4, 5, 5])  # n / (5 x count); absent 2, 3 get the max.
+        np.testing.assert_allclose(missing_two, [0.8, 0.8, 0.8, 0.8, 0.4])
+        np.testing.assert_array_equal(self.n("balanced_class_weights")(ratings, class_weight=None), np.ones(5))
+        with self.assertRaises(ValueError):
+            self.n("balanced_class_weights")(ratings, class_weight="sqrt")
+        features, labels = self.synthetic_features()
+        _, _, weights = self.n("train_reranker")(
+            features[:400], labels[:400], features[400:], labels[400:],
+            params={"min_data_in_leaf": 5, "num_leaves": 4}, num_boost_round=5, early_stopping_rounds=5, log_period=0)
+        np.testing.assert_allclose(weights, self.n("balanced_class_weights")(labels[:400]))  # Balanced by default.
+
+    def test_undoing_class_weights_recovers_the_true_rating_mix(self):
+        truth = np.array([[0.05, 0.05, 0.10, 0.30, 0.50], [0.01, 0.02, 0.07, 0.20, 0.70]])
+        weights = np.array([8.0, 6.0, 3.0, 1.0, 0.3])
+        weighted = truth * weights
+        weighted /= weighted.sum(axis=1, keepdims=True)  # What weighted cross-entropy converges to.
+        np.testing.assert_allclose(self.n("undo_class_weighting")(weighted, weights), truth)
+        with self.assertRaises(ValueError):
+            self.n("undo_class_weighting")(weighted, np.array([1.0, 1, 1, 1, 0]))
+        # A skewed mix like the real one (5% / 5% / 10% / 20% / 60%), driven by bias_baseline.
+        features, _ = self.synthetic_features(count=2000, seed=5)
+        signal = features["bias_baseline"] + np.random.default_rng(6).normal(scale=0.5, size=len(features))
+        ratings = pd.Series(1.0 + np.digitize(signal, np.quantile(signal, [0.05, 0.10, 0.20, 0.40])))
+        booster, _, weights = self.n("train_reranker")(
+            features[:1500], ratings[:1500], features[1500:], ratings[1500:],
+            params={"min_data_in_leaf": 20, "num_leaves": 4, "learning_rate": 0.2}, num_boost_round=300,
+            early_stopping_rounds=20, log_period=0)  # Undoing the weights is exact only near the optimum.
+        raw = self.n("predict_rating_probabilities")(booster, features[1500:])
+        calibrated = self.n("predict_rating_probabilities")(booster, features[1500:], weights)
+        shares = np.bincount(self.n("rating_classes")(ratings[1500:]), minlength=5) / 500
+        self.assertLess(np.abs(calibrated.mean(axis=0) - shares).max(), 0.04)
+        self.assertGreater(np.abs(raw.mean(axis=0) - shares).max(), 0.1)  # Balanced softmax overstates rare ratings.
 
     def test_balanced_decisions_divide_probabilities_by_the_prior(self):
         probabilities = np.array([[0.05, 0.02, 0.03, 0.20, 0.70], [0.0, 0.0, 0.0, 0.1, 0.9]])
@@ -270,7 +300,7 @@ class RerankerNotebookTests(unittest.TestCase):
 
     # Two-tower integration -----------------------------------------------------------------
 
-    def test_training_similarity_matches_the_serving_user_vector(self):
+    def test_training_similarity_matches_recommend_recipes_similarity(self):
         model = self.tiny_two_tower()
         item_features = np.random.default_rng(1).normal(size=(6, 6)).astype(np.float32)
         history = self.ratings([("u1", 0, 5, "2024-01-01"), ("u1", 1, 2, "2024-01-03"), ("u1", 2, 4, "2024-01-06"),
@@ -280,11 +310,9 @@ class RerankerNotebookTests(unittest.TestCase):
         # hides earlier ratings, so the reranker's history must keep it, whatever pairs the two-tower draws.
         targets = history.iloc[[1, 3]]
         similarity = self.n("two_tower_similarity")(model, targets, history, item_features, lookup, device="cpu")
-        user_vector = self.n("two_tower_user_vector")(model, history, "u1", item_features, lookup,
-                                                      cutoff=pd.Timestamp("2024-01-10", tz="UTC"))
-        with torch.no_grad():
-            item_vector = model.encode_items(torch.from_numpy(item_features[[5]]))
-        expected = torch.nn.functional.cosine_similarity(user_vector, item_vector, dim=-1).numpy()
+        served = self.n("recommend_recipes")(model, self.catalog(6), item_features, history, "u1", user_lookup=lookup,
+                                             top_k=6, as_of="2024-01-10")
+        expected = served.loc[served["recipe_id"] == "105", "similarity"].to_numpy()  # Item 5 is rated on Jan 10.
         np.testing.assert_allclose(similarity[1:], expected, atol=1e-5)
         target = history.iloc[[3]]
         self.assertEqual(len(self.n("two_tower_similarity")(model, target.iloc[:0], history, item_features, lookup)), 0)
@@ -300,8 +328,11 @@ class RerankerNotebookTests(unittest.TestCase):
         booster, *_ = self.tiny_booster()
         candidates = self.n("recommend_recipes")(model, catalog, item_features, history, "u1", user_lookup=lookup,
                                                  top_k=5, as_of="2024-02-01")
+        weights = np.array([4.0, 3.0, 2.0, 1.0, 0.5])
+        prior = np.array([0.05, 0.05, 0.1, 0.3, 0.5])
         result = self.n("rerank_recipes")(booster, builder, model, catalog, item_features, history, "u1",
-                                          user_lookup=lookup, retrieve_k=5, top_k=3, as_of="2024-02-01")
+                                          user_lookup=lookup, retrieve_k=5, top_k=3, as_of="2024-02-01",
+                                          class_weights=weights, prior=prior)
         self.assertEqual(len(result), 3)
         self.assertFalse(set(result["recipe_id"]) & {"100", "101", "102"})
         self.assertTrue(result["expected_rating"].is_monotonic_decreasing)
@@ -310,9 +341,18 @@ class RerankerNotebookTests(unittest.TestCase):
         np.testing.assert_allclose(result["expected_rating"], probabilities @ np.arange(1, 6))
         ranks = dict(zip(candidates["recipe_id"], range(1, len(candidates) + 1)))
         self.assertEqual(result["two_tower_rank"].tolist(), [ranks[recipe] for recipe in result["recipe_id"]])
+        similarity = dict(zip(candidates["recipe_id"], candidates["similarity"]))
+        np.testing.assert_allclose(result["two_tower_similarity"], [similarity[r] for r in result["recipe_id"]])
+        np.testing.assert_array_equal(result["predicted_rating"],
+                                      self.n("balanced_decisions")(probabilities, prior) + 1)
+        positions = result["recipe_id"].map(lambda recipe: int(recipe) - 100).to_numpy()
+        features = builder.transform(["u1"] * 3, positions, self.n("utc_day_numbers")(["2024-02-01"])[0],
+                                     result["two_tower_similarity"].to_numpy(np.float32))
+        np.testing.assert_allclose(probabilities, self.n("predict_rating_probabilities")(booster, features, weights))
         with_vectors = self.n("rerank_recipes")(
             booster, builder, model, catalog, item_features, history, "u1", user_lookup=lookup, retrieve_k=5,
-            top_k=3, as_of="2024-02-01", item_embeddings=self.n("encode_catalog")(model, item_features).numpy())
+            top_k=3, as_of="2024-02-01", item_embeddings=self.n("encode_catalog")(model, item_features).numpy(),
+            class_weights=weights, prior=prior)
         pd.testing.assert_frame_equal(with_vectors, result, atol=1e-5)
         with self.assertRaises(ValueError):
             self.n("rerank_recipes")(booster, builder, model, catalog, item_features, history, "u1",
@@ -375,10 +415,7 @@ class RerankerNotebookTests(unittest.TestCase):
         train, heldout = self.n("stratified_split")(observed, validation_fraction=0.2, seed=42)
         lookup = self.n("build_user_lookup")(train)
         model = self.tiny_two_tower(num_users=len(lookup))
-        check = self.n("HistoryDataset")(heldout, train, lookup, max_history=64,
-                                         half_life_days=model.config["half_life_days"], training=False)
-        actual, expected, _ = self.n("predict_ratings")(model, check, item_features, batch_size=1024, device="cpu")
-        rmse = float(np.sqrt(np.mean((actual - expected) ** 2)))
+        item_vectors = self.n("encode_catalog")(model, item_features).numpy()
         code_cells = [cell for cell in self.notebook["cells"] if cell["cell_type"] == "code"]
         with tempfile.TemporaryDirectory() as directory:
             two_tower_dir = Path(directory) / "two_tower"
@@ -388,15 +425,13 @@ class RerankerNotebookTests(unittest.TestCase):
                 "format_version": "test_two_tower", "max_history": 64, "validation_fraction": 0.2, "random_state": 42}))
             catalog.to_csv(two_tower_dir / "catalog.csv", index=False)
             np.save(two_tower_dir / "item_features.npy", item_features)
-            np.save(two_tower_dir / "item_vectors.npy", self.n("encode_catalog")(model, item_features).numpy())
+
             observed.to_csv(two_tower_dir / "observed_ratings.csv", index=False)
             pd.DataFrame({"user_id": list(lookup), "user_index": list(lookup.values())}).to_csv(
                 two_tower_dir / "user_vocabulary.csv", index=False)
 
-            def run(history_rmse):
-                pd.DataFrame({"epoch": [1, 2], "validation_total_loss": [2.0, 1.0],
-                              "validation_rmse": [9.0, history_rmse]}).to_csv(
-                    two_tower_dir / "training_history.csv", index=False)
+            def run(saved_vectors):
+                np.save(two_tower_dir / "item_vectors.npy", saved_vectors)
                 namespace = {"__name__": "__main__"}
                 with contextlib.chdir(ROOT), contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
                     warnings.simplefilter("ignore")
@@ -413,9 +448,9 @@ class RerankerNotebookTests(unittest.TestCase):
                 plt.close("all")
                 return namespace
 
-            with self.assertRaisesRegex(RuntimeError, "does not reproduce the logged best epoch"):
-                run(rmse + 0.01)
-            namespace = run(rmse)
+            with self.assertRaisesRegex(RuntimeError, "does not reproduce item_vectors.npy"):
+                run(item_vectors + 0.01)
+            namespace = run(item_vectors)
             reranker_dir = Path(directory) / "reranker"
             for name in ("lightgbm_reranker.txt", "config.json", "training_history.csv", "test_metrics.csv",
                          "test_ranking.csv"):
@@ -423,8 +458,10 @@ class RerankerNotebookTests(unittest.TestCase):
             config = json.loads((reranker_dir / "config.json").read_text())
             self.assertEqual(config["two_tower_artifact"]["sha256"],
                              self.n("file_sha256")(two_tower_dir / "two_tower.pt"))
-            self.assertEqual((config["objective"], config["activation"], config["num_class"]),
-                             ("multiclass", "softmax", 5))
+            self.assertEqual((config["objective"], config["activation"], config["num_class"], config["class_weight"]),
+                             ("multiclass", "softmax", 5, "balanced"))
+            self.assertIn("lightgbm_without_two_tower", namespace["evaluation"].index)
+            self.assertIn("lightgbm_without_two_tower_expected_rating", namespace["ranking"].index)
             self.assertEqual(config["split"]["rows"]["test"], len(namespace["test_rows"]))
             self.assertEqual(sum(config["split"]["rows"].values()), len(heldout))
             self.assertGreater(namespace["ranking"].loc["lightgbm_expected_rating", "users"], 0)
@@ -434,6 +471,7 @@ class RerankerNotebookTests(unittest.TestCase):
             rated = set(observed.loc[observed["user_id"] == namespace["example_user_id"], "item_index"])
             self.assertFalse(set(catalog.loc[sorted(rated), "recipe_id"]) & set(reranked["recipe_id"]))
             self.assertTrue(reranked[namespace["RERANK_SCORE"]].is_monotonic_decreasing)
+            self.assertTrue(reranked["predicted_rating"].between(1, 5).all())
 
 
 if __name__ == "__main__":

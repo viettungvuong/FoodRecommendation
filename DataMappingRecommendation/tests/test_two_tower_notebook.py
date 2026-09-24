@@ -230,22 +230,31 @@ class TwoTowerNotebookTests(unittest.TestCase):
         torch.testing.assert_close(model.history_weights(torch.randn(1, 2, 8), same_age, torch.tensor([[0, 4]]), both),
                                    torch.tensor([[0.5, 0.5]]))
 
-    def test_user_id_gru_item_towers_and_cut_points_receive_weighted_cross_entropy_gradients(self):
+    def test_both_towers_learn_from_the_in_batch_and_good_over_bad_losses(self):
         torch.manual_seed(9)
         model = self.call("TwoTowerModel", 5, 3, embedding_dim=4, hidden_dim=8, user_id_dropout=0.0)
         mask = torch.tensor([[True, True, False], [True, False, False], [False, False, False]])
-        logits = model(torch.tensor([1, 2, 0]), torch.randn(3, 3, 5), torch.tensor([[4, 0, 0], [2, 0, 0], [0, 0, 0]]),
-                       torch.tensor([[30.0, 2.0, 0.0], [5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]), mask, torch.eye(5)[:3])
-        torch.nn.functional.nll_loss(model.rating_log_probabilities(logits), torch.tensor([0, 2, 4]),
-                                     weight=torch.tensor([3.0, 2.0, 1.5, 1.0, 0.5])).backward()
+        user_args = (torch.tensor([1, 2, 0]), torch.randn(3, 3, 5), torch.tensor([[4, 0, 0], [2, 0, 0], [0, 0, 0]]),
+                     torch.tensor([[30.0, 2.0, 0.0], [5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]), mask)
+        features = torch.eye(5)
+        # The model's only output is cosine similarity: no rating head, always within [-1, 1].
+        similarity = model(*user_args, features[:3])
+        self.assertTrue(torch.all(similarity.abs() <= 1 + 1e-6))
+        self.assertFalse(any(name.startswith(("logit_scale", "first_threshold", "threshold_gaps"))
+                             for name, _ in model.named_parameters()))
+        users, items = model.encode_users(*user_args), model.encode_items(features[:3])
+        batch = {"rating": torch.tensor([5.0, 4.0, 1.0]), "user_index": torch.tensor([1, 2, 0]),
+                 "item_index": torch.tensor([0, 1, 2]), "contrast_sign": torch.tensor([1.0, 0.0, -1.0]),
+                 "contrast_item_index": torch.tensor([3, 0, 4])}
+        retrieval, _ = self.call("in_batch_losses", model, users, items, batch, torch.zeros(5))
+        pairs, _, _ = self.call("ranking_losses", model, users, items, batch, features)
+        (retrieval.mean() + pairs.mean()).backward()
         for module in (model.item_tower, model.user_embedding, model.history_projection,
                        model.history_rnn, model.user_head):
             gradients = [parameter.grad for parameter in module.parameters()]
             self.assertTrue(all(gradient is not None and torch.isfinite(gradient).all()
                                 for gradient in gradients))
             self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
-        for parameter in (model.first_threshold, model.threshold_gaps):
-            self.assertTrue(parameter.grad is not None and torch.isfinite(parameter.grad).all())
 
     def test_cosine_score_ignores_vector_length_and_unknown_users_share_row_zero(self):
         torch.manual_seed(4)
@@ -253,7 +262,7 @@ class TwoTowerNotebookTests(unittest.TestCase):
         users, items = torch.randn(3, 4), torch.randn(3, 4)
         torch.testing.assert_close(model.similarity(users, items),
                                    torch.nn.functional.cosine_similarity(users, items, dim=-1))
-        torch.testing.assert_close(model.score_embeddings(users, items), model.score_embeddings(7 * users, 0.1 * items))
+        torch.testing.assert_close(model.similarity(users, items), model.similarity(7 * users, 0.1 * items))
         lookup = self.call("build_user_lookup", pd.DataFrame({"user_id": ["b", "a", "b"]}))
         self.assertEqual(lookup, {"a": 1, "b": 2})
         targets = pd.DataFrame({"user_id": ["a", "new"], "item_index": [0, 1], "rating": [5.0, 3.0],
@@ -359,32 +368,6 @@ class TwoTowerNotebookTests(unittest.TestCase):
         unpaired = {"contrast_sign": torch.zeros(2), "contrast_item_index": torch.zeros(2, dtype=torch.long)}
         self.assertEqual(len(self.call("ranking_losses", model, users, features, unpaired, features)[2]), 0)
 
-    def test_ordinal_head_gives_valid_probabilities_and_monotone_expected_rating(self):
-        torch.manual_seed(3)
-        model = self.call("TwoTowerModel", 5, 3, embedding_dim=4, hidden_dim=8)
-        with torch.no_grad():
-            model.threshold_gaps.copy_(torch.tensor([-12.0, 0.0, 3.0]))  # Includes a near-zero step.
-        logits = model.exceedance_logits(torch.linspace(-1, 1, 21))
-        log_probabilities = model.rating_log_probabilities(logits)
-        self.assertTrue(torch.isfinite(log_probabilities).all())
-        probabilities = log_probabilities.exp()
-        torch.testing.assert_close(probabilities.sum(-1), torch.ones(21))
-        expected = model.expected_rating(logits)
-        torch.testing.assert_close(expected, (probabilities * torch.arange(1.0, 6.0)).sum(-1))
-        self.assertTrue(torch.all(expected.diff() > 0))
-        self.assertTrue(1 < expected.min() and expected.max() < 5)
-
-    def test_balanced_class_weights_match_scikit_learn_formula(self):
-        ratings = pd.Series([5.0] * 6 + [4.0] * 3 + [1.0])
-        # n_samples / (n_present_classes * count); absent ratings 2 and 3 get the rarest weight.
-        np.testing.assert_allclose(self.call("rating_class_weights", ratings),
-                                   [10 / 3, 10 / 3, 10 / 3, 10 / 9, 10 / 18], rtol=1e-6)
-        np.testing.assert_array_equal(self.call("rating_class_weights", ratings, class_weight=None),
-                                      np.ones(5))
-        for bad in ([4.5], [0.0], [6.0], [np.nan]):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                self.call("rating_class_weights", bad)
-
     def test_five_star_thinning_samples_only_users_with_many_fives(self):
         rows = ([["heavy", 5]] * 400 + [["heavy", 3]] * 2          # limit max(20, 4) = 20 of 400
                 + [["generous", 5]] * 60 + [["generous", 4]] * 40  # limit max(20, 80) >= 60
@@ -419,24 +402,19 @@ class TwoTowerNotebookTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             model, history, metrics = self.call("train_two_tower", model, train_dataset,
                 validation_dataset, features, epochs=3, batch_size=2, device="cpu")
-        self.assertTrue(np.isfinite(history[["train_cross_entropy", "train_in_batch_cross_entropy",
-                                             "train_ranking_loss", "validation_total_loss"]]).all().all())
+        self.assertTrue(np.isfinite(history[["train_in_batch_cross_entropy", "train_ranking_loss",
+                                             "validation_total_loss"]]).all().all())
         self.assertTrue(np.isfinite(list(metrics.values())).all())
-        self.assertEqual(set(metrics), {"rmse", "mae", "macro_mae", "balanced_accuracy", "cross_entropy",
-                                        "in_batch_cross_entropy", "ranking_loss", "pairwise_accuracy"})
-        report = self.call("rating_class_report",
-                           *self.call("predict_ratings", model, validation_dataset, features))
-        self.assertEqual(report.index.tolist(), [1, 2, 3, 4, 5])
-        self.assertEqual(report["count"].sum(), len(validation))
-        self.assertEqual(report["predicted_count"].sum(), len(validation))
+        self.assertEqual(set(metrics), {"in_batch_cross_entropy", "in_batch_rows", "ranking_loss",
+                                        "pairwise_accuracy", "ranking_pairs"})
         for prefix in ("item_tower", "user_head"):
             self.assertTrue(any(not torch.equal(initial[name], parameter)
                                 for name, parameter in model.named_parameters() if name.startswith(prefix)))
         result = self.call("recommend_recipes", model, catalog, features, interactions, "u",
                            user_lookup=lookup, top_k=10, as_of="2024-01-05")
         self.assertEqual(set(result.recipe_id), {"4", "5"})
-        self.assertTrue(result.predicted_rating.between(1, 5).all())
-        self.assertTrue(result.predicted_rating.is_monotonic_decreasing)
+        self.assertTrue(result.similarity.between(-1, 1).all())
+        self.assertTrue(result.similarity.is_monotonic_decreasing)
         before_future = self.call("recommend_recipes", model, catalog, features, interactions, "u",
                                   user_lookup=lookup, top_k=10, as_of="2024-01-03")
         reduced = interactions.loc[interactions.date < pd.Timestamp("2024-01-03", tz="UTC")]
@@ -466,8 +444,7 @@ class TwoTowerNotebookTests(unittest.TestCase):
                 numeric_preprocessing=numeric, joblib=joblib, BERT_MODEL="test-no-download",
                 BERT_REVISION="test", RECENCY_HALF_LIFE_DAYS=180, MAX_HISTORY=64,
                 MISSING_PRICE_ERROR_DOLLARS=2, RANDOM_STATE=13, VALIDATION_FRACTION=0.2,
-                CLASS_WEIGHT="balanced", training_class_weights=np.ones(5, np.float32),
-                IN_BATCH_WEIGHT=0.5, IN_BATCH_TEMPERATURE=0.05, IN_BATCH_MIN_RATING=4,
+                IN_BATCH_TEMPERATURE=0.05, IN_BATCH_MIN_RATING=4,
                 NEUTRAL_HISTORY_WEIGHT=0.5, RANKING_WEIGHT=0.5, RANKING_TEMPERATURE=0.05,
                 MAX_FIVE_STAR_TARGETS_PER_USER=20, MAX_FIVE_TO_OTHER_RATIO=2.0,
                 DATA_PATH=Path("fixture.csv"), training_history=pd.DataFrame({"epoch": [1]}),
@@ -489,15 +466,17 @@ class TwoTowerNotebookTests(unittest.TestCase):
                                restored_history, "user1", user_lookup=restored_lookup,
                                as_of="2024-01-02", item_embeddings=item_vectors)
             self.assertEqual(result.recipe_id.tolist(), expected.recipe_id.tolist())
-            np.testing.assert_allclose(result.predicted_rating, expected.predicted_rating, atol=1e-6)
+            np.testing.assert_allclose(result.similarity, expected.similarity, atol=1e-6)
             self.assertIn("nutrition_scaler", joblib.load(artifact_dir / "content_preprocessing.joblib")["numeric"])
             config = json.loads((artifact_dir / "config.json").read_text())
-            self.assertEqual((config["loss"], config["validation_split"], config["similarity"]),
-                             ("class_weighted_cross_entropy", "stratified_random", "cosine"))
-            self.assertEqual((config["retrieval_loss"], config["in_batch_weight"]),
-                             ("in_batch_sampled_softmax_logq", 0.5))
+            self.assertEqual((config["loss"], config["output"], config["validation_split"], config["similarity"]),
+                             ("in_batch_sampled_softmax_logq", "cosine_similarity_only", "stratified_random", "cosine"))
             self.assertEqual((config["format_version"], config["ranking_loss"], config["model_config"]["neutral_weight"]),
-                             ("recipe_two_tower_v4", "per_user_positive_over_negative_logistic", 0.5))
+                             ("recipe_two_tower_v5", "per_user_positive_over_negative_logistic", 0.5))
+            self.assertNotIn("class_weight", config)
+            # The reranker relies on these two staying in the saved artifacts.
+            np.testing.assert_allclose(item_vectors, self.call("encode_catalog", restored, restored_features), atol=1e-6)
+            self.assertTrue({"max_history", "validation_fraction", "random_state"} <= set(config))
 
 
 if __name__ == "__main__":

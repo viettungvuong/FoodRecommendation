@@ -2,3 +2,5 @@ input/
 input_stage2/
 model_artifacts/
 *.npy
+# Large numpy arrays (model features and vectors); regenerate by running the notebooks.
+*.npy
