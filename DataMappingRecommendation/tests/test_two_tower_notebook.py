@@ -230,25 +230,23 @@ class TwoTowerNotebookTests(unittest.TestCase):
         torch.testing.assert_close(model.history_weights(torch.randn(1, 2, 8), same_age, torch.tensor([[0, 4]]), both),
                                    torch.tensor([[0.5, 0.5]]))
 
-    def test_both_towers_learn_from_the_in_batch_and_good_over_bad_losses(self):
+    def test_both_towers_learn_from_the_batch_softmax(self):
         torch.manual_seed(9)
         model = self.call("TwoTowerModel", 5, 3, embedding_dim=4, hidden_dim=8, user_id_dropout=0.0)
         mask = torch.tensor([[True, True, False], [True, False, False], [False, False, False]])
         user_args = (torch.tensor([1, 2, 0]), torch.randn(3, 3, 5), torch.tensor([[4, 0, 0], [2, 0, 0], [0, 0, 0]]),
                      torch.tensor([[30.0, 2.0, 0.0], [5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]), mask)
         features = torch.eye(5)
-        # The model's only output is cosine similarity: no rating head, always within [-1, 1].
+        # The model's only output is the dot product of the tower vectors: no rating head.
         similarity = model(*user_args, features[:3])
-        self.assertTrue(torch.all(similarity.abs() <= 1 + 1e-6))
+        torch.testing.assert_close(similarity, (model.encode_users(*user_args) * model.encode_items(features[:3])).sum(-1))
         self.assertFalse(any(name.startswith(("logit_scale", "first_threshold", "threshold_gaps"))
                              for name, _ in model.named_parameters()))
         users, items = model.encode_users(*user_args), model.encode_items(features[:3])
-        batch = {"rating": torch.tensor([5.0, 4.0, 1.0]), "user_index": torch.tensor([1, 2, 0]),
-                 "item_index": torch.tensor([0, 1, 2]), "contrast_sign": torch.tensor([1.0, 0.0, -1.0]),
-                 "contrast_item_index": torch.tensor([3, 0, 4])}
-        retrieval, _ = self.call("in_batch_losses", model, users, items, batch, torch.zeros(5))
-        pairs, _, _ = self.call("ranking_losses", model, users, items, batch, features)
-        (retrieval.mean() + pairs.mean()).backward()
+        batch = {"user_index": torch.tensor([1, 2, 0]), "item_index": torch.tensor([0, 1, 2]),
+                 "contrast_sign": torch.tensor([1.0, 0.0, 1.0]), "contrast_item_index": torch.tensor([3, 0, 4])}
+        losses, _, _ = self.call("batch_softmax_losses", model, users, items, batch, features, torch.zeros(5))
+        losses.mean().backward()
         for module in (model.item_tower, model.user_embedding, model.history_projection,
                        model.history_rnn, model.user_head):
             gradients = [parameter.grad for parameter in module.parameters()]
@@ -256,13 +254,12 @@ class TwoTowerNotebookTests(unittest.TestCase):
                                 for gradient in gradients))
             self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
 
-    def test_cosine_score_ignores_vector_length_and_unknown_users_share_row_zero(self):
+    def test_dot_product_score_and_unknown_users_share_row_zero(self):
         torch.manual_seed(4)
         model = self.call("TwoTowerModel", 5, 2, embedding_dim=4, hidden_dim=8)
         users, items = torch.randn(3, 4), torch.randn(3, 4)
-        torch.testing.assert_close(model.similarity(users, items),
-                                   torch.nn.functional.cosine_similarity(users, items, dim=-1))
-        torch.testing.assert_close(model.similarity(users, items), model.similarity(7 * users, 0.1 * items))
+        torch.testing.assert_close(model.similarity(users, items), (users * items).sum(-1))
+        torch.testing.assert_close(model.similarity(2 * users, items), 2 * model.similarity(users, items))
         lookup = self.call("build_user_lookup", pd.DataFrame({"user_id": ["b", "a", "b"]}))
         self.assertEqual(lookup, {"a": 1, "b": 2})
         targets = pd.DataFrame({"user_id": ["a", "new"], "item_index": [0, 1], "rating": [5.0, 3.0],
@@ -274,23 +271,148 @@ class TwoTowerNotebookTests(unittest.TestCase):
                   torch.zeros(2, 1), torch.ones(2, 1, dtype=torch.bool))
         torch.testing.assert_close(model.encode_users(*inputs), model.encode_users(*inputs))
 
-    def test_in_batch_loss_skips_false_negatives_and_corrects_for_popularity(self):
-        model = self.call("TwoTowerModel", 5, 3, embedding_dim=4, hidden_dim=8)
-        users, items = torch.randn(3, 4), torch.randn(3, 4)
-        # Row 0's other columns are the same user (1) and the same recipe (0): no negatives, loss 0.
-        # Row 2 is rated 2, so it is not a query.
-        batch = {"rating": torch.tensor([5.0, 4.0, 2.0]), "user_index": torch.tensor([1, 1, 2]),
-                 "item_index": torch.tensor([0, 1, 0])}
-        losses, rows = self.call("in_batch_losses", model, users, items, batch, torch.zeros(3))
-        np.testing.assert_array_equal(rows, [0, 1])
-        self.assertAlmostEqual(float(losses[0]), 0.0, places=6)
-        self.assertGreater(float(losses[1]), 0.0)  # Column 2 (user 2, recipe 0) is its negative.
-        # A negative that batches sample often is penalized less once log q is subtracted.
-        pair = {"rating": torch.tensor([5.0, 5.0]), "user_index": torch.tensor([1, 2]),
-                "item_index": torch.tensor([0, 1])}
-        uniform, _ = self.call("in_batch_losses", model, users[:2], items[:2], pair, torch.log(torch.full((2,), 0.5)))
-        popular, _ = self.call("in_batch_losses", model, users[:2], items[:2], pair, torch.log(torch.tensor([0.1, 0.9])))
-        self.assertLess(float(popular[0]), float(uniform[0]))
+    def test_batch_softmax_masks_false_negatives_and_pad_like_option_b(self):
+        # The worked example: u1 likes r10, dislikes r22; u2 likes r15, dislikes r30; u3 likes r10, no dislike.
+        model = self.call("TwoTowerModel", 50, 3, embedding_dim=4, hidden_dim=8)
+        model.encode_items = lambda features, item_index=None: features
+        features = torch.randn(50, 4)
+        batch = {"user_index": torch.tensor([1, 2, 3]), "item_index": torch.tensor([10, 15, 10]),
+                 "contrast_sign": torch.tensor([1.0, 1.0, 0.0]), "contrast_item_index": torch.tensor([22, 30, 0])}
+        users = torch.randn(3, 4)
+        losses, has_hard, wins = self.call("batch_softmax_losses", model, users, features[batch["item_index"]],
+                                           batch, features, torch.zeros(50), 1.0)
+        np.testing.assert_array_equal(has_hard, [True, True, False])
+        # Recompute row u1 by hand: columns [r10, r15, r10(u3: mask), r22, r30, PAD(mask)].
+        columns = features[[10, 15, 22, 30]]
+        expected = -torch.log_softmax(columns @ users[0], dim=0)[0]
+        torch.testing.assert_close(losses[0], expected)
+        # u3's positive r10 masks u1's r10 column too; its PAD column never counts.
+        expected = -torch.log_softmax(features[[15, 10, 22, 30]] @ users[2], dim=0)[1]
+        torch.testing.assert_close(losses[2], expected)
+        self.assertEqual(bool(wins[0]), bool(users[0] @ features[10] > users[0] @ features[22]))
+        # Another positive of the same user is masked as a false negative.
+        same = dict(batch, user_index=torch.tensor([1, 1, 3]))
+        same_losses, _, _ = self.call("batch_softmax_losses", model, users, features[batch["item_index"]],
+                                      same, features, torch.zeros(50), 1.0)
+        expected = -torch.log_softmax(features[[10, 22, 30]] @ users[0], dim=0)[0]
+        torch.testing.assert_close(same_losses[0], expected)
+        # A popular in-batch column (large q) is penalized less as a negative.
+        popular_q = torch.zeros(50); popular_q[15] = 3.0
+        popular, _, _ = self.call("batch_softmax_losses", model, users, features[batch["item_index"]],
+                                  batch, features, popular_q, 1.0)
+        self.assertLess(float(popular[0]), float(losses[0]))
+
+    def test_log_q_is_centered_so_hard_negatives_stay_in_play_and_w_weights_them(self):
+        model = self.call("TwoTowerModel", 50, 3, embedding_dim=4, hidden_dim=8)
+        model.encode_items = lambda features, item_index=None: features
+        features = torch.randn(50, 4)
+        batch = {"user_index": torch.tensor([1, 2, 3]), "item_index": torch.tensor([10, 15, 20]),
+                 "contrast_sign": torch.tensor([1.0, 1.0, 0.0]), "contrast_item_index": torch.tensor([22, 30, 0])}
+        users, items = torch.randn(3, 4), features[batch["item_index"]]
+        plain, _, _ = self.call("batch_softmax_losses", model, users, items, batch, features, torch.zeros(50), 1.0)
+        # A log q shared by every recipe (real values are about -12) changes nothing once centered,
+        # so it can't lift the in-batch block above the hard negatives.
+        shared, _, _ = self.call("batch_softmax_losses", model, users, items, batch, features,
+                                 torch.full((50,), -12.0), 1.0)
+        torch.testing.assert_close(shared, plain)
+        # log(w) on the hard block: each hard negative counts w times in the denominator.
+        heavier, _, _ = self.call("batch_softmax_losses", model, users, items, batch, features,
+                                  torch.zeros(50), 1.0, 3.0)
+        logits = users[0] @ features[[10, 15, 20, 22, 30]].T + torch.log(torch.tensor([1.0, 1, 1, 3, 3]))
+        torch.testing.assert_close(heavier[0], torch.logsumexp(logits, 0) - logits[0])
+        self.assertTrue(torch.all(heavier > plain))
+
+    def test_collate_masks_other_positives_neutral_recipes_and_pad_like_the_guide(self):
+        # u1 likes 10 and 12, dislikes 22, is neutral on 44; u2 likes 15 and 10, dislikes 30; u3 likes 44 and 10.
+        ratings = pd.DataFrame([["u1", 10, 5.0], ["u1", 12, 5.0], ["u1", 22, 2.0], ["u1", 44, 3.0],
+                                ["u2", 15, 5.0], ["u2", 10, 4.0], ["u2", 30, 1.0],
+                                ["u3", 44, 5.0], ["u3", 10, 4.0]], columns=["user_id", "item_index", "rating"])
+        ratings["date"] = pd.Timestamp("2024-01-02", tz="UTC")
+        targets = self.call("positive_rows", ratings)
+        dataset = self.call("HistoryDataset", targets, ratings, contrast_pool=ratings)
+        rows = [int(np.flatnonzero((targets.user_id == user) & (targets.item_index == item))[0])
+                for user, item in [("u1", 10), ("u2", 15), ("u3", 44)]]
+        roles = dataset.batch_roles(rows, [10, 15, 44], [22, 30, -1])
+        names = np.array(self.namespace["BATCH_ROLES"], dtype=object)[roles].tolist()
+        # Columns: I:10, I:15, I:44, H:22, H:30, H:PAD. The diagonal and own dislikes are never masked.
+        self.assertEqual(names, [["P", "N", "mask: neutral", "HN", "HN", "mask: PAD"],   # 44 is u1's neutral
+                                 ["mask: liked", "P", "N", "HN", "HN", "mask: PAD"],     # u2 also liked 10
+                                 ["mask: liked", "N", "P", "HN", "HN", "mask: PAD"]])    # u3 also liked 10
+        batch = dataset.collate([dataset[row] for row in rows])
+        self.assertEqual(batch["hard_item_index"].tolist(), [22, 30, -1])  # u3 has no dislike: PAD
+        np.testing.assert_array_equal(batch["mask"].numpy(), roles >= self.namespace["ROLE_LIKED"])
+
+    def test_resample_caps_rows_per_user_and_covers_every_row_over_epochs(self):
+        ratings = pd.DataFrame({"user_id": ["a"] * 6 + ["b"] * 2, "item_index": range(8), "rating": 5.0,
+                                "date": pd.Timestamp("2024-01-02", tz="UTC")})
+        dataset = self.call("HistoryDataset", ratings, ratings)
+        self.assertEqual(len(dataset), 8)
+        used = set()
+        for epoch in range(20):
+            dataset.resample(max_per_user=2, seed=epoch)
+            users = dataset.targets["user_id"].to_numpy()[dataset.active]
+            self.assertEqual(((users == "a").sum(), (users == "b").sum(), len(dataset)), (2, 2, 4))
+            self.assertEqual({dataset[i]["row"] for i in range(len(dataset))}, set(dataset.active.tolist()))
+            used |= set(dataset.active.tolist())
+        self.assertEqual(used, set(range(8)))  # every row is used across epochs
+        self.assertEqual(len(dataset.resample(None)), 8)
+
+    def test_recipe_id_embeddings_and_normalized_towers(self):
+        rows, count = self.call("build_item_id_rows", [0, 0, 2, 2, 2, 3], 5, min_ratings=2)
+        np.testing.assert_array_equal(rows, [1, 0, 2, 0, 0])
+        self.assertEqual(count, 2)
+        torch.manual_seed(2)
+        model = self.call("TwoTowerModel", 3, 1, embedding_dim=4, hidden_dim=8, num_items=5,
+                          num_item_ids=count, item_id_dim=2).set_item_id_rows(rows)
+        model.eval()
+        same_content = torch.ones(5, 3)
+        vectors = model.encode_items(same_content, torch.arange(5))
+        torch.testing.assert_close(vectors.norm(dim=-1), torch.ones(5))  # L2-normalized
+        torch.testing.assert_close(vectors[1], vectors[3])  # rare recipes: zero PAD row, content only
+        self.assertFalse(torch.allclose(vectors[0], vectors[2]))  # their own ID rows differ
+        torch.testing.assert_close(model.item_embedding.weight[0], torch.zeros(2))
+        with self.assertRaises(ValueError):
+            model.encode_items(same_content)  # recipe indices are required with ID embeddings
+        raw = self.call("TwoTowerModel", 3, 1, embedding_dim=4, hidden_dim=8, normalize=False)
+        self.assertFalse(torch.allclose(raw.encode_items(torch.randn(4, 3)).norm(dim=-1), torch.ones(4)))
+
+    def test_recall_at_k_counts_heldout_positives_and_never_recommends_seen_recipes(self):
+        history = pd.DataFrame({"user_id": ["u", "u", "v"], "item_index": [0, 1, 0], "rating": [5.0, 2.0, 4.0],
+                                "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-01"], utc=True)})
+        heldout = pd.DataFrame({"user_id": ["u", "u", "w"], "item_index": [2, 4, 1], "rating": [5.0, 4.0, 5.0],
+                                "date": pd.Timestamp("2024-01-03", tz="UTC")})
+        recall = self.call("RecallAtK", history, heldout, {"u": 1, "v": 2}, 5, ks=(1, 2, 3))
+        self.assertEqual(recall.users, ["u"])  # w has no training history; v has nothing held out
+        # Most-rated order is 0 > 1 > 2 > 3 > 4; u already rated 0 and 1, so it gets 2, 3, 4.
+        result = recall.popularity([10, 9, 8, 7, 6])
+        self.assertEqual((result["recall@1"], result["recall@2"], result["recall@3"]), (0.5, 0.5, 1.0))
+        self.assertEqual(result["heldout_positives"], 2)
+        model = self.call("TwoTowerModel", 3, 2, embedding_dim=4, hidden_dim=8)
+        scored = recall.evaluate(model, np.random.default_rng(0).normal(size=(5, 3)).astype(np.float32), "cpu")
+        self.assertEqual(scored["recall@3"], 1.0)  # only 3 unseen recipes remain, holding both targets
+
+    def test_item_index_serves_the_same_recommendations_as_scoring_every_recipe(self):
+        vectors = np.random.default_rng(1).normal(size=(30, 4)).astype(np.float32)
+        index = self.call("ItemIndex", vectors)  # FAISS on Linux when installed; exact torch scan on macOS
+        queries = np.random.default_rng(2).normal(size=(3, 4)).astype(np.float32)
+        scores, ids = index.search(queries, 5)
+        exact = torch.topk(torch.from_numpy(queries) @ torch.from_numpy(vectors).T, 5, dim=1)
+        np.testing.assert_array_equal(ids, exact.indices.numpy())
+        np.testing.assert_allclose(scores, exact.values.numpy(), rtol=1e-5, atol=1e-5)
+        torch.manual_seed(3)
+        catalog, interactions, features = self.interaction_fixture()
+        model = self.call("TwoTowerModel", 5, 2, embedding_dim=4, hidden_dim=8)
+        catalog_index = self.call("ItemIndex", self.call("encode_catalog", model, features).numpy())
+        scanned = self.call("recommend_recipes", model, catalog, features, interactions, "u", top_k=3,
+                            as_of="2024-01-05")
+        indexed = self.call("recommend_recipes", model, catalog, features, interactions, "u", top_k=3,
+                            as_of="2024-01-05", index=catalog_index)
+        self.assertEqual(indexed.recipe_id.tolist(), scanned.recipe_id.tolist())
+        np.testing.assert_allclose(indexed.similarity, scanned.similarity, atol=1e-5)
+
+    def test_positive_rows_keep_only_four_and_five_star_ratings(self):
+        frame = pd.DataFrame({"rating": [1.0, 2.0, 3.0, 4.0, 5.0], "item_index": range(5)})
+        self.assertEqual(self.call("positive_rows", frame)["rating"].tolist(), [4.0, 5.0])
 
     def test_validation_in_batch_loss_mixes_users_instead_of_reading_sorted_runs(self):
         torch.manual_seed(5)
@@ -299,10 +421,8 @@ class TwoTowerNotebookTests(unittest.TestCase):
         dataset = self.call("HistoryDataset", targets, targets.iloc[:0], {"a": 1, "b": 2}, training=False)
         model = self.call("TwoTowerModel", 4, 2, embedding_dim=4, hidden_dim=8)
         features = np.random.default_rng(0).normal(size=(32, 4)).astype(np.float32)
-        in_batch = {"log_q": torch.zeros(32), "temperature": 0.05, "min_rating": 4.0}
         # In row order, each batch of 16 is one user, every negative is masked, and CE is exactly 0.
-        metrics = self.call("evaluate_two_tower", model, dataset, features, batch_size=16, device="cpu",
-                            in_batch=in_batch)
+        metrics = self.call("evaluate_two_tower", model, dataset, features, batch_size=16, device="cpu")
         self.assertGreater(metrics["in_batch_cross_entropy"], 0.1)
 
     def test_serving_now_hides_recipes_rated_earlier_today(self):
@@ -353,21 +473,6 @@ class TwoTowerNotebookTests(unittest.TestCase):
         np.testing.assert_array_equal(
             self.call("user_history", index, "u", "2024-01-06", max_history=1, exclude_item=[2, 1])[0], [0])
 
-    def test_ranking_loss_is_small_when_the_positive_recipe_outscores_the_negative(self):
-        model = self.call("TwoTowerModel", 2, 1, embedding_dim=2, hidden_dim=4)
-        model.encode_items = lambda features: features  # Item vectors equal their features here.
-        features = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-        users = torch.tensor([[1.0, 0.1], [1.0, 0.1]])  # Prefers recipe 0.
-        # Row 0: positive recipe 0 against negative recipe 1; row 1: negative recipe 1 against positive 0.
-        batch = {"contrast_sign": torch.tensor([1.0, -1.0]), "contrast_item_index": torch.tensor([1, 0])}
-        losses, margins, rows = self.call("ranking_losses", model, users, features, batch, features)
-        self.assertTrue(torch.all(margins > 0))
-        torch.testing.assert_close(margins[0], margins[1])
-        swapped, _, _ = self.call("ranking_losses", model, users[:, [1, 0]], features, batch, features)
-        self.assertTrue(torch.all(swapped > losses))
-        unpaired = {"contrast_sign": torch.zeros(2), "contrast_item_index": torch.zeros(2, dtype=torch.long)}
-        self.assertEqual(len(self.call("ranking_losses", model, users, features, unpaired, features)[2]), 0)
-
     def test_five_star_thinning_samples_only_users_with_many_fives(self):
         rows = ([["heavy", 5]] * 400 + [["heavy", 3]] * 2          # limit max(20, 4) = 20 of 400
                 + [["generous", 5]] * 60 + [["generous", 4]] * 40  # limit max(20, 80) >= 60
@@ -394,26 +499,32 @@ class TwoTowerNotebookTests(unittest.TestCase):
         catalog, interactions, features = self.interaction_fixture()
         train, validation = self.call("stratified_split", interactions, validation_fraction=0.5, seed=0)
         lookup = self.call("build_user_lookup", train)
-        train_dataset = self.call("HistoryDataset", train, train, lookup, contrast_pool=interactions)
-        validation_dataset = self.call("HistoryDataset", validation, train, lookup, training=False,
-                                       contrast_pool=interactions)
-        model = self.call("TwoTowerModel", 5, len(lookup), embedding_dim=4, hidden_dim=8)
+        train_dataset = self.call("HistoryDataset", self.call("positive_rows", train), train, lookup,
+                                  contrast_pool=interactions)
+        validation_dataset = self.call("HistoryDataset", self.call("positive_rows", validation), train, lookup,
+                                       training=False, contrast_pool=interactions)
+        item_rows, item_ids = self.call("build_item_id_rows", self.call("positive_rows", train)["item_index"], 5,
+                                        min_ratings=1)
+        model = self.call("TwoTowerModel", 5, len(lookup), embedding_dim=4, hidden_dim=8, num_items=5,
+                          num_item_ids=item_ids, item_id_dim=2).set_item_id_rows(item_rows)
+        recall = self.call("RecallAtK", train, self.call("positive_rows", validation), lookup, 5, ks=(1, 2))
+        self.assertTrue(recall.users)
         initial = {name: value.detach().clone() for name, value in model.named_parameters()}
         with contextlib.redirect_stdout(io.StringIO()):
             model, history, metrics = self.call("train_two_tower", model, train_dataset,
-                validation_dataset, features, epochs=3, batch_size=2, device="cpu")
-        self.assertTrue(np.isfinite(history[["train_in_batch_cross_entropy", "train_ranking_loss",
-                                             "validation_total_loss"]]).all().all())
-        self.assertTrue(np.isfinite(list(metrics.values())).all())
-        self.assertEqual(set(metrics), {"in_batch_cross_entropy", "in_batch_rows", "ranking_loss",
-                                        "pairwise_accuracy", "ranking_pairs"})
+                validation_dataset, features, epochs=3, batch_size=2, device="cpu", max_rows_per_user=1,
+                recall_evaluator=recall)
+        self.assertTrue(np.isfinite(history[["train_in_batch_cross_entropy", "validation_in_batch_cross_entropy",
+                                             "validation_recall@1", "validation_recall@2"]]).all().all())
+        self.assertTrue((history["train_rows"] <= train_dataset.targets["user_id"].nunique()).all())
+        self.assertEqual(set(metrics), {"in_batch_cross_entropy", "in_batch_rows", "hard_negative_rows",
+                                        "hard_negative_accuracy"})
         for prefix in ("item_tower", "user_head"):
             self.assertTrue(any(not torch.equal(initial[name], parameter)
                                 for name, parameter in model.named_parameters() if name.startswith(prefix)))
         result = self.call("recommend_recipes", model, catalog, features, interactions, "u",
                            user_lookup=lookup, top_k=10, as_of="2024-01-05")
         self.assertEqual(set(result.recipe_id), {"4", "5"})
-        self.assertTrue(result.similarity.between(-1, 1).all())
         self.assertTrue(result.similarity.is_monotonic_decreasing)
         before_future = self.call("recommend_recipes", model, catalog, features, interactions, "u",
                                   user_lookup=lookup, top_k=10, as_of="2024-01-03")
@@ -430,7 +541,9 @@ class TwoTowerNotebookTests(unittest.TestCase):
         observations = self.call("build_interactions", self.recipe_rows(), catalog)
         dim = features.shape[1]
         lookup = self.call("build_user_lookup", observations)
-        model = self.call("TwoTowerModel", dim, len(lookup), embedding_dim=4, hidden_dim=8)
+        item_rows, item_ids = self.call("build_item_id_rows", observations["item_index"], len(catalog), min_ratings=1)
+        model = self.call("TwoTowerModel", dim, len(lookup), embedding_dim=4, hidden_dim=8, num_items=len(catalog),
+                          num_item_ids=item_ids, item_id_dim=2).set_item_id_rows(item_rows)
         expected = self.call("recommend_recipes", model, catalog, features, observations,
                              "user1", user_lookup=lookup, as_of="2024-01-02")
         save_cells = [cell for cell in self.notebook["cells"]
@@ -444,8 +557,8 @@ class TwoTowerNotebookTests(unittest.TestCase):
                 numeric_preprocessing=numeric, joblib=joblib, BERT_MODEL="test-no-download",
                 BERT_REVISION="test", RECENCY_HALF_LIFE_DAYS=180, MAX_HISTORY=64,
                 MISSING_PRICE_ERROR_DOLLARS=2, RANDOM_STATE=13, VALIDATION_FRACTION=0.2,
-                IN_BATCH_TEMPERATURE=0.05, IN_BATCH_MIN_RATING=4,
-                NEUTRAL_HISTORY_WEIGHT=0.5, RANKING_WEIGHT=0.5, RANKING_TEMPERATURE=0.05,
+                IN_BATCH_TEMPERATURE=0.05, HARD_NEGATIVE_WEIGHT=1.0, MAX_ROWS_PER_USER=50,
+                MIN_ITEM_RATINGS_FOR_ID=5, NORMALIZE_EMBEDDINGS=True, NEUTRAL_HISTORY_WEIGHT=0.5,
                 MAX_FIVE_STAR_TARGETS_PER_USER=20, MAX_FIVE_TO_OTHER_RATIO=2.0,
                 DATA_PATH=Path("fixture.csv"), training_history=pd.DataFrame({"epoch": [1]}),
                 user_lookup=lookup)
@@ -470,9 +583,11 @@ class TwoTowerNotebookTests(unittest.TestCase):
             self.assertIn("nutrition_scaler", joblib.load(artifact_dir / "content_preprocessing.joblib")["numeric"])
             config = json.loads((artifact_dir / "config.json").read_text())
             self.assertEqual((config["loss"], config["output"], config["validation_split"], config["similarity"]),
-                             ("in_batch_sampled_softmax_logq", "cosine_similarity_only", "stratified_random", "cosine"))
-            self.assertEqual((config["format_version"], config["ranking_loss"], config["model_config"]["neutral_weight"]),
-                             ("recipe_two_tower_v5", "per_user_positive_over_negative_logistic", 0.5))
+                             ("in_batch_softmax_hard_negatives_masked_logq", "dot_product_only", "stratified_random",
+                              "dot_product"))
+            self.assertEqual((config["format_version"], config["normalized_embeddings"],
+                              config["model_config"]["neutral_weight"], config["model_config"]["num_item_ids"]),
+                             ("recipe_two_tower_v8", True, 0.5, item_ids))
             self.assertNotIn("class_weight", config)
             # The reranker relies on these two staying in the saved artifacts.
             np.testing.assert_allclose(item_vectors, self.call("encode_catalog", restored, restored_features), atol=1e-6)
