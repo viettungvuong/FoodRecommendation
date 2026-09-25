@@ -239,13 +239,17 @@ class TwoTowerNotebookTests(unittest.TestCase):
             raw_path = Path(directory) / "RAW_recipes.csv"
             pd.DataFrame({"id": [1, 2, 3, 4], "name": ["a", "b", "c", "d"], "minutes": [10, 20, 30, 40],
                           "n_steps": [3, 4, 5, 6], "description": ["one", None, "three", "four"],
-                          "ingredients": ["['salt']"] * 4}).to_csv(raw_path, index=False)
+                          "ingredients": ["['salt']"] * 4,
+                          "tags": ["['course', '60-minutes-or-less', 'Desserts']", "[]", "['easy', 'preparation', 'easy']",
+                                   None]}).to_csv(raw_path, index=False)
             catalog = pd.DataFrame({"recipe_id": ["3", "1", "5"], "name": ["C", "A", "E"]})
             metadata = self.call("load_recipe_metadata", catalog, raw_path)
         self.assertEqual(metadata["recipe_id"].tolist(), ["3", "1", "5"])  # Catalog order, missing recipes too.
         self.assertEqual(metadata["minutes"].iloc[:2].tolist(), [30, 10])
         self.assertTrue(np.isnan(metadata["minutes"].iloc[2]))
         self.assertEqual(self.call("recipe_texts", catalog, metadata), ["C. three", "A. one", "E."])
+        # Tags: hyphens become spaces, lowercase, deduplicated, category headers ("course", "preparation") dropped.
+        self.assertEqual(self.call("recipe_tags", metadata), [["easy"], ["60 minutes or less", "desserts"], []])
 
     def test_recipe_extras_are_log_scaled_clipped_standardized_and_flag_missing_values(self):
         metadata = pd.DataFrame({"minutes": [10, 20, 30, 1e7, None, -5], "n_steps": [1, 2, 3, 4, 5, None]})
@@ -688,6 +692,7 @@ class TwoTowerNotebookTests(unittest.TestCase):
     def test_notebook_artifacts_restore_identical_recommendations(self):
         torch.manual_seed(13)
         catalog = self.call("build_recipe_catalog", self.recipe_rows())
+        catalog["tag_terms"] = [["easy", "desserts"], [], ["60 minutes or less"]]
         groups, _, numeric = self.call("build_numeric_features", catalog, n_clusters=2)
         features, feature_groups = self.call("stack_feature_groups", groups)
         observations = self.call("build_interactions", self.recipe_rows(), catalog)
