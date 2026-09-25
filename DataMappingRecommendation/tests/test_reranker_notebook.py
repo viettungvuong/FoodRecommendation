@@ -125,9 +125,10 @@ class RerankerNotebookTests(unittest.TestCase):
             early_stopping_rounds=10, log_period=0)
         return booster, features, ratings, history
 
-    def tiny_two_tower(self, feature_dim=6, num_users=2, seed=0):
+    def tiny_two_tower(self, feature_dim=6, num_items=6, seed=0):
         torch.manual_seed(seed)
-        return self.n("TwoTowerModel")(feature_dim, num_users, embedding_dim=4, hidden_dim=8, user_id_dim=4).eval()
+        return self.n("TwoTowerModel")([["dense", 0, feature_dim]], num_items, embedding_dim=4, part_dim=4,
+                                       hidden_dim=8).eval()
 
     # As-of statistics -----------------------------------------------------------------------
 
@@ -305,33 +306,32 @@ class RerankerNotebookTests(unittest.TestCase):
         item_features = np.random.default_rng(1).normal(size=(6, 6)).astype(np.float32)
         history = self.ratings([("u1", 0, 5, "2024-01-01"), ("u1", 1, 2, "2024-01-03"), ("u1", 2, 4, "2024-01-06"),
                                 ("u1", 5, 4, "2024-01-10"), ("u1", 3, 1, "2024-01-12"), ("u2", 4, 3, "2024-01-02")])
-        lookup = {"u1": 1, "u2": 2}
-        # Row 1 (a 2 on Jan 3) is an opposite-level recipe of the target (a 4 on Jan 10). Serving never
-        # hides earlier ratings, so the reranker's history must keep it, whatever pairs the two-tower draws.
+        # Serving never hides earlier ratings (the 2 on Jan 3 included), so the reranker's history for the
+        # target (a 4 on Jan 10) must keep every earlier rating, like recommend_recipes.
         targets = history.iloc[[1, 3]]
-        similarity = self.n("two_tower_similarity")(model, targets, history, item_features, lookup, device="cpu")
-        served = self.n("recommend_recipes")(model, self.catalog(6), item_features, history, "u1", user_lookup=lookup,
+        similarity = self.n("two_tower_similarity")(model, targets, history, item_features, device="cpu")
+        served = self.n("recommend_recipes")(model, self.catalog(6), item_features, history, "u1",
                                              top_k=6, as_of="2024-01-10")
         expected = served.loc[served["recipe_id"] == "105", "similarity"].to_numpy()  # Item 5 is rated on Jan 10.
         np.testing.assert_allclose(similarity[1:], expected, atol=1e-5)
         target = history.iloc[[3]]
-        self.assertEqual(len(self.n("two_tower_similarity")(model, target.iloc[:0], history, item_features, lookup)), 0)
+        self.assertEqual(len(self.n("two_tower_similarity")(model, target.iloc[:0], history, item_features)), 0)
 
     def test_rerank_recipes_orders_candidates_by_probability_and_skips_rated_recipes(self):
         catalog = self.catalog(8)
-        model = self.tiny_two_tower()
+        model = self.tiny_two_tower(num_items=8)
         item_features = np.random.default_rng(2).normal(size=(8, 6)).astype(np.float32)
         history = self.ratings([("u1", 0, 5, "2024-01-01"), ("u1", 1, 2, "2024-01-03"), ("u1", 2, 4, "2024-01-06"),
                                 ("u2", 3, 3, "2024-01-02"), ("u2", 4, 5, "2024-01-04")])
         lookup = {"u1": 1, "u2": 2}
         builder = self.n("RerankFeatureBuilder")(history, catalog, prior_mean=4.0, user_lookup=lookup)
         booster, *_ = self.tiny_booster()
-        candidates = self.n("recommend_recipes")(model, catalog, item_features, history, "u1", user_lookup=lookup,
+        candidates = self.n("recommend_recipes")(model, catalog, item_features, history, "u1",
                                                  top_k=5, as_of="2024-02-01")
         weights = np.array([4.0, 3.0, 2.0, 1.0, 0.5])
         prior = np.array([0.05, 0.05, 0.1, 0.3, 0.5])
         result = self.n("rerank_recipes")(booster, builder, model, catalog, item_features, history, "u1",
-                                          user_lookup=lookup, retrieve_k=5, top_k=3, as_of="2024-02-01",
+                                          retrieve_k=5, top_k=3, as_of="2024-02-01",
                                           class_weights=weights, prior=prior)
         self.assertEqual(len(result), 3)
         self.assertFalse(set(result["recipe_id"]) & {"100", "101", "102"})
@@ -350,7 +350,7 @@ class RerankerNotebookTests(unittest.TestCase):
                                      result["two_tower_similarity"].to_numpy(np.float32))
         np.testing.assert_allclose(probabilities, self.n("predict_rating_probabilities")(booster, features, weights))
         with_vectors = self.n("rerank_recipes")(
-            booster, builder, model, catalog, item_features, history, "u1", user_lookup=lookup, retrieve_k=5,
+            booster, builder, model, catalog, item_features, history, "u1", retrieve_k=5,
             top_k=3, as_of="2024-02-01", item_embeddings=self.n("encode_catalog")(model, item_features).numpy(),
             class_weights=weights, prior=prior)
         pd.testing.assert_frame_equal(with_vectors, result, atol=1e-5)
@@ -410,11 +410,20 @@ class RerankerNotebookTests(unittest.TestCase):
 
     def test_notebook_runs_end_to_end_on_tiny_two_tower_artifacts(self):
         observed = self.random_ratings()
+        # As in the real artifacts: a light user dropped by the filter (fewer than 3 ratings).
+        observed = pd.concat([observed, self.ratings([("2000", 3, 4, "2023-03-01"), ("2000", 7, 2, "2023-04-01")])],
+                             ignore_index=True)
         catalog = self.catalog(60)
         item_features = np.random.default_rng(4).normal(size=(60, 6)).astype(np.float32)
-        train, heldout = self.n("stratified_split")(observed, validation_fraction=0.2, seed=42)
+        train, _ = self.n("per_user_split")(self.n("core_filter")(observed, 3, 5), 10)
+        trained = set(zip(train["user_id"], train["item_index"]))
+        # Reranker rows: ratings the two-tower never trained on (held out, or dropped by the filter).
+        heldout = observed[observed["rating"].gt(0) & np.array([pair not in trained for pair in
+                                                                 zip(observed["user_id"], observed["item_index"])])]
+        self.assertTrue({"2000"} < set(heldout["user_id"]) and heldout["rating"].between(1, 5).all())
         lookup = self.n("build_user_lookup")(train)
-        model = self.tiny_two_tower(num_users=len(lookup))
+        self.assertNotIn("2000", lookup)
+        model = self.tiny_two_tower(num_items=60)
         item_vectors = self.n("encode_catalog")(model, item_features).numpy()
         code_cells = [cell for cell in self.notebook["cells"] if cell["cell_type"] == "code"]
         with tempfile.TemporaryDirectory() as directory:
@@ -422,7 +431,8 @@ class RerankerNotebookTests(unittest.TestCase):
             two_tower_dir.mkdir()
             torch.save({"state_dict": model.state_dict(), "model_config": model.config}, two_tower_dir / "two_tower.pt")
             (two_tower_dir / "config.json").write_text(json.dumps({
-                "format_version": "test_two_tower", "max_history": 64, "validation_fraction": 0.2, "random_state": 42}))
+                "format_version": "test_two_tower", "max_history": 64, "min_user_ratings": 3,
+                "min_recipe_ratings": 5, "holdout_per_user": 10, "random_state": 42}))
             catalog.to_csv(two_tower_dir / "catalog.csv", index=False)
             np.save(two_tower_dir / "item_features.npy", item_features)
 
