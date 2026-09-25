@@ -1,61 +1,80 @@
-# Complex Recipe Classification Labels (Non-Rule-Based)
+# Recipe Classification Labels
 
-This document covers recipe classification labels that **cannot be accurately solved using simple keyword filters or if-then rules**. These labels require machine learning models (like classifier chains) because they depend on contextual reasoning, ingredient ratios, technical nuance, and cultural context.
+The rows are USDA FDC food items (10,845), not full recipes: each has a description, `product` / `adj` / `verb` terms and nine nutrient columns. `recipe_labeling.ipynb` turns these into multi-label silver labels with keyword + nutrient rules, and `recipe_classification.ipynb` trains a classifier on the terms and nutrients to predict them.
 
----
-
-## 1. Authenticity, Origin & Fusion
-*These labels require analyzing the specific combination and harmony of ingredients rather than just looking for geographic keywords.*
-
-*   **Fusion Cuisine (e.g., Tex-Mex, Asian-Mexican Fusion):** Rules cannot easily distinguish where one cuisine ends and another begins based on raw text alone. 
-*   **Street Food Style:** This relies on the context of portability, preparation speed, and cultural presentation rather than an ingredient checklist.
-
-## 2. Occasion, Meal Course & Context
-*These labels depend heavily on preparation complexity, presentation, and cultural habits.*
-
-*   **Weeknight Dinner:** Requires evaluating prep time, cook time, tool usage, and overall cognitive load, which simple text filters cannot accurately measure.
-*   **Kid-Friendly:** Relies on the subtle absence of polarizing textures, visual appeal, and mild flavor profiles that rules struggle to evaluate.
-
-## 3. Flavor Profiles & Sensory Qualities
-*Flavors are chemical interactions. Rules fail because they cannot calculate how ingredients amplify, mask, or balance one another.*
-
-*   **Spicy:** Food with Chili/Mustard or adjenct products (like Mala) in product
-*   **Umami-Rich:** Requires detecting the synergistic effect of combining specific ingredients (like tomatoes + mushrooms + soy sauce) that trigger deep savory notes.
-*   **Tangy / Zesty:** Relies on the acidic balance against fats and sugars. A rule tracking "lemon juice" will miss the balancing act of sugar that neutralizes sharpness.
-
-## 4. Technical Complexity & Skill Level
-*Complexity lives in the verbs of the instructions, not the nouns of the ingredient list.*
-
-*   **Advanced / Gourmet:** A recipe with three ingredients (like traditional French soufflé) can require extreme technical precision that keyword rules will completely miss.
-*   **Easy:** A recipe with easy to find ingredients and easy to cook (does not need much prep time)
-*   **One-Pot / One-Pan:** Rules looking for "pot" or "pan" fail when a recipe secretly requires multiple bowls for prep, marination, or separate resting stages.
+A keyword list is only a starting point for these labels. Each depends on context: the combination of terms, the preparation (verbs), or the nutrient balance. The classifier learns that context from the term embeddings and nutrient components, so it can label items the rules miss.
 
 ---
 
-## 5. Meal Role & Food Type
-*What part of a meal an item plays. Keywords give a starting point, but the nutrient profile decides edge cases (e.g. "chicken" in a soup vs a plain breast).*
+## Label Overview
 
-*   **Protein Centerpiece:** A meat, poultry, fish or seafood item a meal is built around. The product term names the cut, and the nutrients confirm it (high protein, almost no carbohydrate). Breaded, sauced or mixed dishes fall out on the carb / sodium profile rather than on a keyword list.
-*   **Breakfast:** Items eaten in the morning: cereal, oatmeal, pancakes, waffles, eggs, bacon, breakfast sausage, muffins, bagels, yogurt. Eggs and bacon also appear in other meals, so this needs the combination of product, preparation (`scrambled`, `toasted`) and nutrients, not one keyword.
-*   **Dessert / Sweet Treat:** Cakes, cookies, pies, puddings, ice cream and candy. Sugar content separates a real dessert from a savoury pie or an unsweetened "chocolate" baking ingredient.
-*   **Drink:** Anything consumed as a beverage (coffee, tea, juice, soft drinks, milk, alcohol). The energy density and macro split are very different from solid foods, so the nutrient columns alone carry much of the signal. `beverage` is already detected as context in `recipe_labeling.ipynb`.
-*   **Pantry Staple / Cooking Ingredient:** Items that are an input to cooking rather than something eaten as is: oils, spices, flour, dry rice / pasta / beans, nuts and seeds, syrups, vinegar. The `dry`, `unprepared`, `raw` adjectives plus a very high energy density (oils) or a starch-heavy profile make this learnable.
-*   **Fresh Produce / Light & Fresh:** Raw or lightly prepared fruits and vegetables. Low energy density, fiber and low protein separate them from dried fruit, fried vegetables or vegetable dishes with sauce.
+Rows = rows with the label in `input_stage2/recipe_classes.csv`. An item can have several labels.
 
-## 6. Preparation & Convenience
-*How the item reaches the plate. This lives in the verbs (`frozen`, `canned`, `grilled`) that the embedding marks as a separate term type.*
+| Group | Label | Column | Rows |
+|---|---|---|---:|
+| Cuisine & Style | Fusion Cuisine | `fusion_cuisine` | 55 |
+| | Street Food Style | `street_food_style` | 556 |
+| Occasion & Meal Role | Weeknight Dinner | `weeknight_dinner` | 626 |
+| | Kid-Friendly | `kid_friendly` | 2,102 |
+| | Breakfast | `breakfast` | 675 |
+| | Dessert / Sweet Treat | `dessert_sweet_treat` | 391 |
+| | Protein Centerpiece | `protein_centerpiece` | 2,247 |
+| Flavor | Spicy | `spicy` | 72 |
+| | Umami-Rich | `umami_rich` | 1,785 |
+| | Smoky / Grilled | `smoky_grilled` | 953 |
+| Effort & Skill | Advanced / Gourmet | `advanced_gourmet` | 168 |
+| | Easy | `easy` | 4,319 |
+| | One-Pot / One-Pan | `one_pot_one_pan` | 505 |
+| | Ready-to-Eat / Convenience | `ready_to_eat` | 1,846 |
+| Texture & Satiety | Crispy / Crunchy | `crispy_crunchy` | 859 |
+| | Hearty / Filling | `hearty_filling` | 2,394 |
+| — | Generic (no other label) | `generic` | 2,648 |
 
-*   **Ready-to-Eat / Convenience:** Frozen meals, canned goods, fast food, restaurant items and anything labelled `ready`, `instant` or `prepared`. The verb and adjective terms are the main signal. High sodium backs it up for processed items.
-*   **Smoky / Grilled:** Food cooked with dry heat (grilled, broiled, roasted, smoked, barbecued, rotisserie). This is a flavour profile that comes from the cooking method, not the ingredient. It is complementary to `umami_rich` and covers many cooked meat rows that are `generic` today.
+`fusion_cuisine` is still labelled but is too rare to learn, so `recipe_classification.ipynb` drops it.
 
-## 7. Texture & Satiety
-*Sensory and "how filling" qualities that come from the macro balance rather than from a named ingredient.*
+---
 
-*   **Crispy / Crunchy:** Fried, toasted or baked-dry foods (chips, crackers, pretzels, fried chicken, nuts, granola). A frying or toasting verb plus a fat + carbohydrate-dense, low-moisture profile. A keyword rule on "fried" alone would miss crackers and nuts and wrongly include fried eggs.
-*   **Hearty / Filling:** Foods with a high satiety value: lots of protein and fiber per calorie (lean meats, beans, lentils, eggs, whole grains). This is a nutrient ratio, so it is naturally learned from the nutrient components rather than from text.
+## 1. Cuisine & Style
+*These labels depend on how ingredients are combined and served, not only on geographic keywords.*
 
-### Notes for adding these to `recipe_labeling.ipynb`
-- **Exclusivity:** `drink` should not co-occur with food-only labels such as `crispy_crunchy`, `protein_centerpiece` or `pantry_staple`, and `pantry_staple` should not co-occur with `ready_to_eat`.
-- **Size:** `protein_centerpiece`, `hearty_filling` and `ready_to_eat` are large. They would reduce the `generic` share and the imbalance against it (currently `generic` vs `spicy` is about 60:1).
-- **Existing labels:** `authentic_regional`, `holiday_celebration` and `game_day_snack` are no longer described above but are still produced by the notebook; drop them there too if they are retired.
-- **Caveat:** these are still silver labels from rules over the same inputs, so model scores will measure how well the rules are recovered, not true label quality.
+*   **Fusion Cuisine (e.g., Tex-Mex, Asian-Mexican Fusion):** Rules cannot easily tell where one cuisine ends and another begins from raw text alone.
+*   **Street Food Style:** Depends on portability, preparation speed and cultural presentation rather than an ingredient checklist.
+
+## 2. Occasion & Meal Role
+*When an item is eaten and what part of the meal it plays. Keywords give a starting point, but the nutrient profile decides edge cases (e.g. "chicken" in a soup vs a plain breast).*
+
+*   **Weeknight Dinner:** Depends on prep time, cook time, tool usage and overall effort, which simple text filters cannot measure.
+*   **Kid-Friendly:** Relies on the absence of polarizing textures and strong flavors, which rules struggle to evaluate.
+*   **Breakfast:** Items eaten in the morning: cereal, oatmeal, pancakes, waffles, eggs, bacon, muffins, bagels, yogurt. Eggs and bacon also appear in other meals, so this needs the combination of product, preparation (`scrambled`, `toasted`) and nutrients.
+*   **Dessert / Sweet Treat:** Cakes, cookies, pies, puddings, ice cream and candy. Sugar content separates a real dessert from a savory pie or an unsweetened baking ingredient.
+*   **Protein Centerpiece:** A meat, poultry, fish or seafood item a meal is built around. The product term names the cut, and the nutrients confirm it (high protein, almost no carbohydrate). Breaded, sauced and mixed dishes fall out on the nutrient profile.
+
+## 3. Flavor
+*Flavors come from how ingredients amplify, mask or balance one another, and from how the food is cooked.*
+
+*   **Spicy:** Food with chili, mustard or related products (like mala, wasabi, horseradish, sriracha, kimchi) in the product terms. Mild variants and sweet peppers are excluded.
+*   **Umami-Rich:** Requires detecting the combined effect of specific ingredients (like tomatoes + mushrooms + soy sauce) that create deep savory notes.
+*   **Smoky / Grilled:** Food cooked with dry heat (grilled, broiled, roasted, smoked, barbecued, rotisserie). The flavor comes from the cooking method (the verbs), not the ingredient.
+
+## 4. Effort & Skill
+*Complexity and convenience live in the verbs (`frozen`, `canned`, `braised`), not in the product names.*
+
+*   **Advanced / Gourmet:** A dish with few ingredients (like a French soufflé) can still require technical precision that keyword rules miss.
+*   **Easy:** Easy-to-find ingredients and easy to cook, without much prep time: ready-to-eat items, fresh produce, and simply cooked foods (boiled, baked, scrambled). Slow methods (braised, whole roasts), gourmet items and hard-to-find ingredients (game meat, imported cuts, specialty seafood) are excluded.
+*   **One-Pot / One-Pan:** Rules looking for "pot" or "pan" fail when a dish needs separate components (breaded, layered, stuffed, served with sides).
+*   **Ready-to-Eat / Convenience:** Frozen meals, canned goods, fast food, restaurant items, snacks and anything labelled `ready`, `instant` or `prepared`. Verb and adjective terms are the main signal, backed by high sodium for processed items.
+
+## 5. Texture & Satiety
+*Sensory and "how filling" qualities that come from the macro balance rather than a named ingredient.*
+
+*   **Crispy / Crunchy:** Fried, toasted or baked-dry foods (chips, crackers, pretzels, fried chicken, nuts, granola). A frying or toasting verb plus a fat + carbohydrate-dense profile. A rule on "fried" alone would miss crackers and nuts and wrongly include fried eggs or fried rice.
+*   **Hearty / Filling:** High satiety value: lots of protein and fiber per calorie (lean meats, fish, beans, eggs). This is a nutrient ratio, so it is learned from the nutrient components rather than from text.
+
+---
+
+## Label Rules
+
+- **Generic:** rows with no other label are `generic`. It is exclusive: a `generic` row never has another label.
+- **Item types (not labels):** the labeling notebook still detects drinks, pantry ingredients (oils, spices, flour, dry grains / beans, dry mixes) and raw fresh produce, only to include or exclude rows. Drinks never get `crispy_crunchy`, `easy`, `ready_to_eat`, `hearty_filling` or `smoky_grilled`. Pantry ingredients never get `easy`, `ready_to_eat` or `hearty_filling`. Fresh produce counts as `easy`. Rows that are only one of these item types end up `generic`.
+- **Metadata (not targets):** `heat_level` (`none` / `medium` / `hot`, from the spicy products) and `cuisine_region` (one or more regions, pipe-joined) are stored alongside the labels.
+- **Caveat:** these are silver labels from rules over the same inputs the classifier sees, so model scores measure how well the rules are recovered, not true label quality.
