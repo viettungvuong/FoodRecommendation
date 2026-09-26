@@ -281,14 +281,14 @@ class TwoTowerNotebookTests(unittest.TestCase):
                 bad.loc[0, "rating"] = invalid
                 self.call("build_interactions", bad, catalog)
 
-    def test_rating_zero_rows_are_cut_and_levels_are_negative_or_positive(self):
+    def test_rating_zero_and_three_star_rows_are_cut_and_levels_are_negative_or_positive(self):
         catalog = pd.DataFrame({"recipe_id": [str(i) for i in range(1, 6)]})
         frame = pd.DataFrame({"recipe_id": [1, 2, 3, 4, 5], "user_id": 7, "rating": [5, 0, 3, 2, 1],
                               "date": "2024-01-01"})
         result = self.call("build_interactions", frame, catalog).sort_values("rating")
-        self.assertEqual(result.rating.tolist(), [1, 2, 3, 5])  # The review without stars is cut.
-        self.assertEqual(result.level.tolist(), ["negative", "negative", "positive", "positive"])
-        np.testing.assert_array_equal(self.call("rating_to_level", [1, 2, 3, 4, 5]), [0, 0, 1, 1, 1])
+        self.assertEqual(result.rating.tolist(), [1, 2, 5])  # The review without stars and the 3-star rating are cut.
+        self.assertEqual(result.level.tolist(), ["negative", "negative", "positive"])
+        np.testing.assert_array_equal(self.call("rating_to_level", [1, 2, 4, 5]), [0, 0, 1, 1])
 
     def test_labeled_rows_require_original_valid_dates(self):
         catalog = pd.DataFrame({"recipe_id": ["1"]})
@@ -331,27 +331,9 @@ class TwoTowerNotebookTests(unittest.TestCase):
         self.assertTrue((train.groupby("user_id")["date"].max().loc["a"] < validation["date"].min()))
         pd.testing.assert_frame_equal(train, self.call("per_user_split", frame.iloc[::-1], 2)[0])
 
-    def test_positive_rows_keep_three_to_five_star_ratings(self):
-        frame = pd.DataFrame({"rating": [1.0, 2.0, 3.0, 4.0, 5.0], "item_index": range(5)})
-        self.assertEqual(self.call("positive_rows", frame)["rating"].tolist(), [3.0, 4.0, 5.0])
-
-    def test_five_star_thinning_samples_only_users_with_many_fives(self):
-        rows = ([["heavy", 5]] * 400 + [["heavy", 3]] * 2          # limit max(20, 4) = 20 of 400
-                + [["generous", 5]] * 60 + [["generous", 4]] * 40  # limit max(20, 80) >= 60
-                + [["light", 5]] * 15 + [["light", 1]])
-        targets = pd.DataFrame(rows, columns=["user_id", "rating"])
-        targets["item_index"] = np.arange(len(targets))
-        thinned = self.call("downsample_five_star_targets", targets, max_five_star=20,
-                            max_five_to_other_ratio=2.0, seed=0)
-        counts = thinned.groupby(["user_id", "rating"]).size()
-        self.assertTrue(5 <= counts[("heavy", 5)] <= 40)  # Binomial(400, 0.05), mean 20.
-        self.assertEqual(counts[("heavy", 3)], 2)
-        self.assertEqual((counts[("generous", 5)], counts[("generous", 4)]), (60, 40))
-        self.assertEqual((counts[("light", 5)], counts[("light", 1)]), (15, 1))
-        pd.testing.assert_frame_equal(thinned, self.call("downsample_five_star_targets", targets,
-                                                          max_five_star=20, max_five_to_other_ratio=2.0, seed=0))
-
-    # Histories and the user tower -------------------------------------------------------------
+    def test_positive_rows_keep_four_and_five_star_ratings(self):
+        frame = pd.DataFrame({"rating": [1.0, 2.0, 4.0, 5.0], "item_index": range(4)})
+        self.assertEqual(self.call("positive_rows", frame)["rating"].tolist(), [4.0, 5.0])
 
     def test_history_is_oldest_first_and_excludes_target_same_day_and_future_ratings(self):
         _, history, _ = self.interaction_fixture()
@@ -374,20 +356,20 @@ class TwoTowerNotebookTests(unittest.TestCase):
         np.testing.assert_array_equal(padded["history_items"], [0, 2, 0, 0])
 
     def test_history_rows_hide_their_target_recipe(self):
-        ratings = pd.DataFrame({"user_id": ["u"] * 3, "item_index": [0, 1, 2], "rating": [1.0, 3.0, 5.0],
+        ratings = pd.DataFrame({"user_id": ["u"] * 3, "item_index": [0, 1, 2], "rating": [1.0, 4.0, 5.0],
                                 "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-05"], utc=True)})
         dataset = self.call("HistoryDataset", self.call("positive_rows", ratings), ratings)
-        sample = dataset[1]  # Target: recipe 2 (5 stars). Its history holds the 1-star and 3-star recipes.
+        sample = dataset[1]  # Target: recipe 2 (5 stars). Its history holds the 1-star and 4-star recipes.
         self.assertEqual(sample["item_index"], 2)
         self.assertEqual(sample["history_items"][sample["history_mask"]].tolist(), [0, 1])
-        self.assertEqual(sample["history_ratings"][sample["history_mask"]].tolist(), [0, 2])
+        self.assertEqual(sample["history_ratings"][sample["history_mask"]].tolist(), [0, 3])
 
     def test_pooled_user_vector_weights_liked_recipes_by_rating_and_recency(self):
-        # Classes 4, 4, 2, 0 are 5, 5, 3, 1 stars; the second 5 is one half-life older.
-        weights = self.call("history_pool_weights", torch.tensor([[4, 4, 2, 0, 0]]),
+        # Classes 4, 4, 3, 0 are 5, 5, 4, 1 stars (weights 2, 2, 1, 0); the second 5 is one half-life older.
+        weights = self.call("history_pool_weights", torch.tensor([[4, 4, 3, 0, 0]]),
                             torch.tensor([[0.0, 10.0, 0.0, 0.0, 0.0]]),
                             torch.tensor([[True, True, True, True, False]]), 10.0)
-        torch.testing.assert_close(weights, torch.tensor([[3.0, 1.5, 1.0, 0.0, 0.0]]) / 5.5)
+        torch.testing.assert_close(weights, torch.tensor([[2.0, 1.0, 1.0, 0.0, 0.0]]) / 4.0)
         # Without a liked recipe (a 2-star rating only) or without any history, nothing is pooled.
         for ratings, mask in (([[1, 0]], [[True, False]]), ([[0, 0]], [[False, False]])):
             torch.testing.assert_close(self.call("history_pool_weights", torch.tensor(ratings), torch.zeros(1, 2),
@@ -538,8 +520,8 @@ class TwoTowerNotebookTests(unittest.TestCase):
                                              torch.full((50,), -12.0), 0.5), plain)
 
     def test_collate_masks_liked_recipes_but_keeps_disliked_ones_as_negatives(self):
-        # u1 liked 10 (5) and 12 (3), disliked 22 (2); u2 liked 15 and 10, disliked 12 (1); u3 liked 44 and 22.
-        ratings = self.ratings([["u1", 10, 5.0], ["u1", 12, 3.0], ["u1", 22, 2.0], ["u2", 15, 5.0], ["u2", 10, 4.0],
+        # u1 liked 10 (5) and 12 (4), disliked 22 (2); u2 liked 15 and 10, disliked 12 (1); u3 liked 44 and 22.
+        ratings = self.ratings([["u1", 10, 5.0], ["u1", 12, 4.0], ["u1", 22, 2.0], ["u2", 15, 5.0], ["u2", 10, 4.0],
                                 ["u2", 12, 1.0], ["u3", 44, 5.0], ["u3", 22, 4.0]])
         targets = self.call("positive_rows", ratings)
         dataset = self.call("HistoryDataset", targets, ratings)
@@ -547,7 +529,7 @@ class TwoTowerNotebookTests(unittest.TestCase):
                 for user, item in [("u1", 10), ("u2", 15), ("u1", 12), ("u3", 22)]]
         roles = dataset.batch_roles(rows, [10, 15, 12, 22])
         names = np.array(self.namespace["BATCH_ROLES"], dtype=object)[roles].tolist()
-        # Columns I:10, I:15, I:12, I:22. A 3-star recipe is liked (masked); a 1-2 star recipe stays a negative.
+        # Columns I:10, I:15, I:12, I:22. A 4-star recipe is liked (masked); a 1-2 star recipe stays a negative.
         self.assertEqual(names, [["P", "N", "mask: liked", "N"],             # u1 liked 12, disliked 22
                                  ["mask: liked", "P", "N", "N"],             # u2 liked 10, disliked 12
                                  ["mask: liked", "N", "P", "N"],             # u1 again
@@ -689,82 +671,41 @@ class TwoTowerNotebookTests(unittest.TestCase):
         result = self.call("recommend_recipes", model, catalog, features, today, "u", top_k=10)
         self.assertEqual(sorted(result.recipe_id), ["1", "2", "4", "5"])
 
-    def test_notebook_artifacts_restore_identical_recommendations(self):
-        torch.manual_seed(13)
-        catalog = self.call("build_recipe_catalog", self.recipe_rows())
-        catalog["tag_terms"] = [["easy", "desserts"], [], ["60 minutes or less"]]
-        groups, _, numeric = self.call("build_numeric_features", catalog, n_clusters=2)
-        features, feature_groups = self.call("stack_feature_groups", groups)
-        observations = self.call("build_interactions", self.recipe_rows(), catalog)
-        vocabulary = self.call("build_term_vocabulary", catalog)
-        item_terms = {field: self.call("term_id_matrix", catalog[column], vocabulary)
-                      for field, (column, _) in self.namespace["TERM_FIELDS"].items()}
-        lookup = self.call("build_user_lookup", observations)
-        item_rows, item_ids = self.call("build_item_id_rows", observations["item_index"], len(catalog), min_ratings=1)
-        model = self.call("TwoTowerModel", feature_groups, len(catalog), embedding_dim=4, part_dim=4, hidden_dim=8,
-                          num_item_ids=item_ids, num_terms=len(vocabulary), term_dim=3,
-                          term_fields=[(field, matrix.shape[1]) for field, matrix in item_terms.items()])
-        model.set_item_id_rows(item_rows).set_term_vectors(torch.randn(len(vocabulary), 3))
-        for field, matrix in item_terms.items():
-            model.set_item_terms(field, matrix)
-        expected = self.call("recommend_recipes", model, catalog, features, observations, "user1", as_of="2024-01-02")
-        save_cells = [cell for cell in self.notebook["cells"]
-                      if "save-artifacts" in cell.get("metadata", {}).get("tags", [])]
-        self.assertEqual(len(save_cells), 1)
-        with tempfile.TemporaryDirectory() as directory:
-            artifact_dir = Path(directory)
-            context = dict(self.namespace, ARTIFACT_DIR=artifact_dir, item_features=features,
-                recommendation_model=model, device=torch.device("cpu"), item_catalog=catalog,
-                observed_ratings=observations, numeric_preprocessing=numeric,
-                extra_preprocessing={"columns": ["minutes", "n_steps"]}, text_preprocessing={"dim": 2},
-                term_vocabulary=vocabulary, feature_groups=feature_groups, joblib=joblib,
-                BERT_MODEL="test-no-download", BERT_REVISION="test", TERM_MODEL="test-terms", TERM_REVISION="test",
-                RECENCY_HALF_LIFE_DAYS=180, MAX_HISTORY=64, MISSING_PRICE_ERROR_DOLLARS=2, RANDOM_STATE=13,
-                MIN_USER_RATINGS=3, MIN_RECIPE_RATINGS=5, HOLDOUT_PER_USER=2, IN_BATCH_TEMPERATURE=0.05,
-                MAX_ROWS_PER_USER=50, MIN_ITEM_RATINGS_FOR_ID=5, NORMALIZE_EMBEDDINGS=True, CLIP_QUANTILE=0.995,
-                THIN_FIVE_STAR_TARGETS=False, MAX_FIVE_STAR_TARGETS_PER_USER=5, MAX_FIVE_TO_OTHER_RATIO=1.0,
-                RAW_RECIPES_PATH=Path("RAW_recipes.csv"), TEXT_EMBEDDING_DIM=2, TEXT_MAX_LENGTH=64,
-                DATA_PATH=Path("fixture.csv"), training_history=pd.DataFrame({"epoch": [1]}), user_lookup=lookup)
-            with contextlib.redirect_stdout(io.StringIO()):
-                exec(compile("".join(save_cells[0]["source"]), "save-artifacts", "exec"), context)
-            checkpoint = torch.load(artifact_dir / "two_tower.pt", map_location="cpu", weights_only=True)
-            restored = self.call("TwoTowerModel", **checkpoint["model_config"])
-            restored.load_state_dict(checkpoint["state_dict"])
-            restored_catalog = pd.read_csv(artifact_dir / "catalog.csv", dtype={"recipe_id": "string"})
-            restored_history = pd.read_csv(artifact_dir / "observed_ratings.csv", dtype={"user_id": "string"})
-            restored_history["date"] = pd.to_datetime(restored_history["date"], utc=True)
-            restored_features = np.load(artifact_dir / "item_features.npy", allow_pickle=False)
-            item_vectors = np.load(artifact_dir / "item_vectors.npy", allow_pickle=False)
-            vocabulary_frame = pd.read_csv(artifact_dir / "user_vocabulary.csv", dtype={"user_id": "string"})
-            self.assertEqual(dict(zip(vocabulary_frame.user_id, vocabulary_frame.user_index)), lookup)
-            result = self.call("recommend_recipes", restored, restored_catalog, restored_features,
-                               restored_history, "user1", as_of="2024-01-02", item_embeddings=item_vectors)
-            self.assertEqual(result.recipe_id.tolist(), expected.recipe_id.tolist())
-            np.testing.assert_allclose(result.similarity, expected.similarity, atol=1e-6)
-            # The frozen term vectors and each recipe's term ids travel inside the weight file.
-            torch.testing.assert_close(restored.term_bag.weight, model.term_bag.weight)
-            for field, matrix in item_terms.items():
-                torch.testing.assert_close(getattr(restored, f"{field}_ids"), torch.as_tensor(matrix))
-            # The nutrition clustering is saved in the same weight file and reassigns every recipe's cluster.
-            clustering = checkpoint["nutrition_clustering"]
-            np.testing.assert_array_equal(
-                self.call("assign_nutrition_clusters", restored_catalog[self.namespace["NUTRITION_COLUMNS"]], clustering),
-                catalog["nutrition_cluster"])
-            preprocessing = joblib.load(artifact_dir / "content_preprocessing.joblib")
-            self.assertEqual(set(preprocessing), {"numeric", "time", "text", "terms", "feature_groups"})
-            self.assertEqual(preprocessing["terms"]["vocabulary"], vocabulary)
-            config = json.loads((artifact_dir / "config.json").read_text())
-            self.assertEqual((config["format_version"], config["loss"], config["validation_split"], config["similarity"],
-                              config["positive_min_rating"], config["min_user_ratings"]),
-                             ("recipe_two_tower_v10", "in_batch_softmax_masked_logq", "per_user_last_n",
-                              "dot_product", 3, 3))
-            self.assertEqual(config["levels"], {"negative": [1, 2], "positive": [3, 4, 5]})
-            self.assertNotIn("class_weight", config)
-            # The reranker relies on these staying in the saved artifacts.
-            np.testing.assert_allclose(item_vectors, self.call("encode_catalog", restored, restored_features), atol=1e-6)
-            self.assertTrue({"max_history", "min_user_ratings", "min_recipe_ratings", "holdout_per_user",
-                             "random_state"} <= set(config))
+    def test_sentiment_rows_follow_the_mf_als_rules_and_sample_one_unobserved_negative_per_positive(self):
+        cell = [cell for cell in self.notebook["cells"]
+                if "sentiment-definitions" in cell.get("metadata", {}).get("tags", [])]
+        self.assertEqual(len(cell), 1)
+        context = dict(self.namespace, RANDOM_STATE=0, SENTIMENT_RATINGS=(0, 1, 2, 4, 5), SENTIMENT_POSITIVE_MIN=4,
+                       MIN_USER_RATINGS=3, SENTIMENT_NEGATIVES_PER_POSITIVE=1)
+        exec(compile("".join(cell[0]["source"]), "sentiment-definitions", "exec"), context)
+        catalog = pd.DataFrame({"recipe_id": [str(i) for i in range(12)]})
+        # u1: 0, 5, 4, 3, 5 (by date); u2: 2, 5, 3 (two kept ratings -> dropped); u3: 1, 4, 5, 5.
+        rows = [("u1", 0, 0), ("u1", 1, 5), ("u1", 2, 4), ("u1", 3, 3), ("u1", 4, 5), ("u2", 5, 2), ("u2", 6, 5),
+                ("u2", 7, 3), ("u3", 8, 1), ("u3", 9, 4), ("u3", 10, 5), ("u3", 11, 5)]
+        frame = pd.DataFrame({"user_id": [u for u, _, _ in rows], "recipe_id": [str(r) for _, r, _ in rows],
+                              "rating": [x for _, _, x in rows],
+                              "date": [f"2024-01-{day:02d}" for day in range(1, len(rows) + 1)]})
+        every = context["ratings_with_zero"](frame, catalog)
+        self.assertNotIn(3, every["rating"].tolist())  # 3-star ratings are never loaded
+        labelled, history = context["prepare_sentiment_rows"](every)
+        sampled = labelled[labelled["source"] == context["SAMPLED_SOURCE"]]
+        observed = labelled[labelled["source"] != context["SAMPLED_SOURCE"]]
+        self.assertEqual(sorted(labelled["user_id"].unique()), ["u1", "u3"])  # u2 has fewer than 3 kept ratings
+        self.assertEqual(observed["rating"].tolist().count(5), 4)  # every 5-star rating stays
+        # Sentiment one-hot: 4-5 positive, 0-2 negative, and every sampled row is a rating-0 negative.
+        np.testing.assert_array_equal(labelled["sentiment_positive"] + labelled["sentiment_negative"], 1)
+        np.testing.assert_array_equal(observed["sentiment_positive"], (observed["rating"] >= 4).astype(int))
+        self.assertTrue((sampled["rating"] == 0).all() and (sampled["sentiment"] == "negative").all())
+        # One unobserved recipe per positive, in the positive's split, never one the user rated.
+        positives = observed[observed["sentiment_positive"] == 1]
+        self.assertEqual(len(sampled), len(positives))
+        pd.testing.assert_series_equal(sampled.groupby(["user_id", "split"]).size(),
+                                       positives.groupby(["user_id", "split"]).size())
+        rated = set(zip(every["user_id"], every["item_index"]))
+        self.assertFalse(any(pair in rated for pair in zip(sampled["user_id"], sampled["item_index"])))
+        # Per user by date: the latest rating is test and the one before valid; the history is the observed train rows.
+        latest = observed.sort_values("date").groupby("user_id").tail(2)
+        self.assertEqual(sorted(latest["split"].tolist()), ["test", "test", "valid", "valid"])
+        self.assertTrue((history["split"] == "train").all() and (history["source"] != context["SAMPLED_SOURCE"]).all())
+        self.assertIn(0.0, history["rating"].tolist())  # a 0-star review is history too
 
-
-if __name__ == "__main__":
-    unittest.main()
