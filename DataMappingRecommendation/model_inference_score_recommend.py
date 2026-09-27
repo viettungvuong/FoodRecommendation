@@ -4,14 +4,20 @@
    ItemEncoder, i.e. its product / adj / verb tokens concatenated with its standardized [price, nutrients], and the
    embeddings go into an HNSW index with cosine distance.
 2. Query: the user's representative embedding is the average of their history recipes' embeddings.
-3. Retrieval: HNSW returns the recipes closest to it by cosine similarity, the history's own recipes excluded.
-4. User state: the history is cut into windows wherever two ratings are window_gap_days (about 6 months) or more
+3. Retrieval: HNSW returns the recipes closest to it by cosine similarity, the history's own recipes excluded, sorted
+   by that similarity, most similar first.
+4. Near-duplicates of the history: the candidates go into a dictionary of buckets by that similarity ([0.9, 1],
+   [0.8, 0.9), ...). Each history recipe gives a range of it, the similarities a recipe at cosine MAX_SIMILARITY or
+   more to that history recipe can have; the buckets the range overlaps are looked up, a window slides over their
+   candidates inside the range, and the ones at cosine MAX_SIMILARITY or more to the history recipe are dropped. (The
+   catalog has many near-identical recipes under different fdc_ids, e.g. the same food as patties and as crumbles.)
+5. User state: the history is cut into windows wherever two ratings are window_gap_days (about 6 months) or more
    apart; the GRU runs over each window from a fresh state, and each window's final hidden state is stored.
-5. Reranking: each candidate attends over [user profile; window states] and gets P(like); candidates are sorted by it.
-6. Diversity: maximal marginal relevance (MMR) picks the top_k from the reranked candidates, each pick maximizing
-   lambda * P(like) - (1 - lambda) * its highest cosine similarity to an earlier pick, so near-identical recipes (the
-   catalog has many, e.g. the same food as patties and as crumbles) do not fill the list. A candidate whose cosine to
-   a pick is MMR_MAX_SIMILARITY or more is never picked, so the list can be shorter than top_k.
+6. Reranking: each candidate attends over [user profile; window states] and gets P(like); candidates are sorted by it.
+7. Diversity: maximal marginal relevance (MMR) picks the top_k from the reranked candidates, each pick maximizing
+   lambda * P(like) - (1 - lambda) * its highest cosine similarity to an earlier pick, so near-identical recipes do
+   not fill the list. A candidate whose cosine to a pick is MAX_SIMILARITY or more is never picked, so the list can
+   be shorter than top_k.
 
 Usage:
     python model_inference_score_recommend.py build --catalog path/to/price_mapped_nutrients.csv
@@ -22,6 +28,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import hnswlib
@@ -51,8 +58,13 @@ HNSW_EF_SEARCH = 200
 # 1 among them), and without the cutoff below, at 0.6 or more exact duplicates of the catalog still reach the example
 # users' top 10.
 MMR_LAMBDA = 0.5
-# A candidate this close (cosine) to a pick is never picked, whatever its P(like).
-MMR_MAX_SIMILARITY = 0.97
+# Near-duplicate cutoff (cosine): a candidate this close to a history recipe or to a pick is never recommended,
+# whatever its P(like).
+MAX_SIMILARITY = 0.97
+# Candidates are bucketed by cosine to the user embedding: [0.9, 1], [0.8, 0.9), ...
+BUCKET_WIDTH = 0.1
+# Widens the history ranges past float32 rounding in HNSW's and torch's cosines, so none is missed at a range's edge.
+RANGE_SLACK = 1e-4
 SEED = 42
 
 
@@ -347,7 +359,71 @@ class RecipeIndex:
                 if row not in exclude][:k]
 
 
-def mmr(relevance, similarity, k, lambda_=MMR_LAMBDA, max_similarity=MMR_MAX_SIMILARITY):
+def bucket_of(similarity):
+    """Bucket of a cosine similarity: bucket b holds [b * BUCKET_WIDTH, (b + 1) * BUCKET_WIDTH), the top one also 1."""
+    scale = round(1 / BUCKET_WIDTH)
+    return min(math.floor(similarity * scale), scale - 1)  # * 10, not / 0.1: 0.3 / 0.1 is 2.999...
+
+
+def similarity_buckets(candidates):
+    """{bucket: [(row, similarity), ...]} of (row, cosine similarity to the user embedding) candidates, each bucket's
+    most similar first."""
+    buckets = {}
+    for row, similarity in sorted(candidates, key=lambda candidate: -candidate[1]):
+        buckets.setdefault(bucket_of(similarity), []).append((row, similarity))
+    return buckets
+
+
+def history_ranges(history_similarity, max_similarity=MAX_SIMILARITY):
+    """{(position, low, high)}, one per history recipe: the cosine similarities to the user embedding that a recipe at
+    cosine max_similarity or more to that history recipe can have.
+
+    Angles between vectors obey the triangle inequality, so the angle of such a recipe to the user embedding is the
+    history recipe's ± arccos(max_similarity), 14 degrees for 0.97; the range is those angles' cosines. A fixed small
+    margin would miss some: with the current model, ± 0.01 around the history recipe's similarity misses 9 of the 14
+    near-duplicates in the example users' candidates."""
+    margin = math.acos(min(max(max_similarity, -1.0), 1.0))
+    ranges = set()
+    for position, similarity in enumerate(history_similarity):
+        angle = math.acos(min(max(similarity, -1.0), 1.0))
+        ranges.add((position, math.cos(min(math.pi, angle + margin)) - RANGE_SLACK,
+                    math.cos(max(0.0, angle - margin)) + RANGE_SLACK))
+    return ranges
+
+
+def drop_near_history(buckets, ranges, candidate_unit, history_unit, max_similarity=MAX_SIMILARITY):
+    """The buckets without the candidates at cosine max_similarity or more to a history recipe, and those candidates as
+    {row: (history position, cosine)}.
+
+    candidate_unit[row] is a bucketed candidate's L2-normalized embedding, history_unit[position] a history recipe's.
+    A candidate is compared only with the history recipes whose range holds its similarity: for each range, the
+    buckets it overlaps are looked up in the dictionary, and in each a window slides down to the candidates inside
+    it. Ranges go highest first, so a bucket's window only ever moves down."""
+    windows = {}  # Bucket → (start, end) of its window over the bucket's candidates.
+    near = {}
+    for position, low, high in sorted(ranges, key=lambda item: (-item[2], -item[1])):
+        for bucket in range(bucket_of(high), bucket_of(low) - 1, -1):
+            if bucket not in buckets:
+                continue
+            items = buckets[bucket]
+            start, end = windows.get(bucket, (0, 0))
+            while start < len(items) and items[start][1] > high:
+                start += 1
+            end = max(start, end)  # Never narrower than the range; wider only compares a few more candidates.
+            while end < len(items) and items[end][1] >= low:
+                end += 1
+            windows[bucket] = start, end
+            for row, _ in items[start:end]:
+                if row in near:
+                    continue
+                cosine = float(candidate_unit[row] @ history_unit[position])
+                if cosine >= max_similarity:
+                    near[row] = position, cosine
+    kept = {bucket: [item for item in items if item[0] not in near] for bucket, items in buckets.items()}
+    return {bucket: items for bucket, items in kept.items() if items}, near
+
+
+def mmr(relevance, similarity, k, lambda_=MMR_LAMBDA, max_similarity=MAX_SIMILARITY):
     """Maximal marginal relevance: positions of up to k items, in the order they are picked.
 
     Each pick is the item maximizing lambda_ * relevance - (1 - lambda_) * its highest similarity to an item already
@@ -437,15 +513,16 @@ class RetrievalPipeline:
         recipe weighs the same under cosine similarity."""
         return F.normalize(history_emb, dim=1).mean(0)
 
-    def recommend(self, user, n_candidates=100, top_k=10, mmr_lambda=MMR_LAMBDA, max_similarity=MMR_MAX_SIMILARITY,
+    def recommend(self, user, n_candidates=100, top_k=10, mmr_lambda=MMR_LAMBDA, max_similarity=MAX_SIMILARITY,
                   log=None, show=20):
         """Up to top_k of n_candidates retrieved recipes, picked by MMR over P(like) and the cosine similarity of their
-        item embeddings, in pick order. A candidate whose cosine to a pick is max_similarity or more is left out, so
-        fewer than top_k come back when every other candidate is that close to a pick. mmr_lambda = 1 with
-        max_similarity = None gives the top_k by P(like), most likely first.
+        item embeddings, in pick order. A candidate whose cosine to a history recipe or to a pick is max_similarity or
+        more is left out, so fewer than top_k come back when every other candidate is that close to one.
+        mmr_lambda = 1 with max_similarity = None gives the top_k by P(like), most likely first.
 
         With log (e.g. print), each step is reported: the history, the user embedding, the HNSW candidates (the first
-        `show` of them), how the reranker reorders them and what MMR picks."""
+        `show` of them), the near-duplicates of the history dropped, how the reranker reorders the rest and what MMR
+        picks."""
         log = log or (lambda *_: None)
         if not user.get("history"):
             raise ValueError("The pipeline needs at least one recipe in the user's history.")
@@ -481,20 +558,53 @@ class RetrievalPipeline:
             log(f"  cosine to {str(recipe.get('name', ''))[:48]:<48} {cosine:.3f}")
 
         seen = {self.row_of[recipe["fdc_id"]] for recipe in history if "fdc_id" in recipe}
-        candidates = self.recipe_index.search(query.numpy(), n_candidates, exclude=seen)
-        log(f"\n=== Step 3. HNSW retrieval: {len(candidates)} nearest of {len(self.recipes):,} recipes by cosine "
+        # HNSW already returns them most similar first; the buckets and the retrieval ranks rely on it.
+        retrieved = sorted(self.recipe_index.search(query.numpy(), n_candidates, exclude=seen),
+                           key=lambda candidate: -candidate[1])
+        log(f"\n=== Step 3. HNSW retrieval: {len(retrieved)} nearest of {len(self.recipes):,} recipes by cosine "
             f"similarity ({len(seen)} history recipes excluded) ===")
         log(f"  {'rank':>4}  {'fdc_id':>8}  {'recipe':<56} {'cosine':>7}")
-        for rank, (row, similarity) in enumerate(candidates[:show], start=1):
+        for rank, (row, similarity) in enumerate(retrieved[:show], start=1):
             log(f"  {rank:>4}  {self.recipes[row]['fdc_id']:>8}  {self.recipes[row]['name'][:56]:<56} {similarity:>7.3f}")
-        if len(candidates) > show:
-            log(f"  ... {len(candidates) - show} more")
+        if len(retrieved) > show:
+            log(f"  ... {len(retrieved) - show} more")
+        if not retrieved:
+            return []
+
+        buckets = similarity_buckets(retrieved)
+        if max_similarity is not None:
+            rows = [row for row, _ in retrieved]
+            retrieved_unit = F.normalize(torch.from_numpy(self.recipe_index.embeddings[rows]), dim=1).numpy()
+            ranges = history_ranges(member_cosine, max_similarity)
+            kept, near = drop_near_history(buckets, ranges, dict(zip(rows, retrieved_unit)),
+                                           F.normalize(history_emb, dim=1).numpy(), max_similarity)
+            log(f"\n=== Step 4. Near-duplicates of the history: candidates bucketed by cosine to the user embedding; "
+                f"each history recipe's range (where a recipe at cosine >= {max_similarity:g} to it can be) is looked "
+                f"up in the buckets and slid over; {len(near)} such candidates dropped ===")
+            log(f"  {'bucket':<10} {'retrieved':>9} {'kept':>5}")
+            for bucket, items in sorted(buckets.items(), reverse=True):
+                label = (f"[{bucket * BUCKET_WIDTH:.1f}, {(bucket + 1) * BUCKET_WIDTH:.1f}"
+                         f"{']' if bucket == bucket_of(1.0) else ')'}")
+                log(f"  {label:<10} {len(items):>9} {len(kept.get(bucket, [])):>5}")
+            log(f"  {'history recipe':<48} {'cosine':>7}  {'range':<14} {'in range':>8} {'dropped':>7}")
+            for position, low, high in sorted(ranges):
+                inside = sum(low <= similarity <= high for _, similarity in retrieved)
+                dropped = sum(near_position == position for near_position, _ in near.values())
+                log(f"  {str(history[position].get('name', ''))[:48]:<48} {member_cosine[position]:>7.3f}  "
+                    f"{f'[{low:.3f}, {high:.3f}]':<14} {inside:>8} {dropped:>7}")
+            for row, (position, similarity) in list(near.items())[:show]:
+                log(f"  dropped {self.recipes[row]['fdc_id']:>8}  {self.recipes[row]['name'][:44]:<44} cosine "
+                    f"{similarity:.3f} to {str(history[position].get('name', ''))[:40]}")
+            if len(near) > show:
+                log(f"  ... {len(near) - show} more")
+            buckets = kept
+        candidates = [candidate for bucket in sorted(buckets, reverse=True) for candidate in buckets[bucket]]
         if not candidates:
             return []
 
         if self.reranker.windowed:
             self.user_states[user.get("user_id")] = state = self.user_state(history, history_emb)
-            log(f"\n=== Step 4. User state: GRU hidden state of each window (restarted per window), stored in "
+            log(f"\n=== Step 5. User state: GRU hidden state of each window (restarted per window), stored in "
                 f"pipeline.user_states ===")
             log(f"  {'window':>6}  {'from':<10}  {'to':<10} {'recipes':>7} {'mean rating':>11} {'|state|':>8}  first 6 dims")
             for window in state["windows"]:
@@ -506,17 +616,18 @@ class RetrievalPipeline:
         rows = [row for row, _ in candidates]
         candidate_emb = torch.from_numpy(self.recipe_index.embeddings[rows])
         p_likes = self.reranker.score(history, history_emb, candidate_emb)
+        retrieval_rank = {row: rank for rank, (row, _) in enumerate(retrieved, start=1)}
         results = [{"fdc_id": self.recipes[row]["fdc_id"], "name": self.recipes[row]["name"],
                     "price": self.recipes[row]["price"], "p_like": p_like, "like": p_like >= THRESHOLD,
-                    "similarity": similarity, "retrieval_rank": rank}
-                   for rank, ((row, similarity), p_like) in enumerate(zip(candidates, p_likes.tolist()), start=1)]
+                    "similarity": similarity, "retrieval_rank": retrieval_rank[row]}
+                   for (row, similarity), p_like in zip(candidates, p_likes.tolist())]
         reranked = sorted(results, key=lambda result: -result["p_like"])
         for rank, result in enumerate(reranked, start=1):
             result["rerank_rank"] = rank
 
         keys = (f"the hidden states of {len(self.user_states[user.get('user_id')]['windows'])} windows"
                 if self.reranker.windowed else f"GRU states of the last {min(len(history), t_max)} history recipes")
-        log(f"\n=== Step 5. Reranker: each candidate attends over [user profile; {keys}] -> P(like) ===")
+        log(f"\n=== Step 6. Reranker: each candidate attends over [user profile; {keys}] -> P(like) ===")
         log(f"  {'new':>4} {'was':>4} {'move':>5}  {'fdc_id':>8}  {'recipe':<48} {'cosine':>7} {'P(like)':>8}")
         for new_rank, result in enumerate(reranked[:show], start=1):
             move = result["retrieval_rank"] - new_rank
@@ -530,7 +641,7 @@ class RetrievalPipeline:
         picked = mmr(p_likes.numpy(), cosine, top_k, mmr_lambda, max_similarity)
         recommended = [results[position] for position in picked]
         cutoff = "" if max_similarity is None else f"; none at cosine >= {max_similarity:g} to a pick"
-        log(f"\n=== Step 6. MMR: each pick maximizes {mmr_lambda:g} * P(like) - {1 - mmr_lambda:g} * its highest cosine "
+        log(f"\n=== Step 7. MMR: each pick maximizes {mmr_lambda:g} * P(like) - {1 - mmr_lambda:g} * its highest cosine "
             f"to an earlier pick{cutoff} ===")
         log(f"  {'pick':>4} {'was':>4}  {'fdc_id':>8}  {'recipe':<48} {'P(like)':>8} {'closest':>7}")
         for pick, (position, result) in enumerate(zip(picked, recommended), start=1):
@@ -544,7 +655,7 @@ class RetrievalPipeline:
             too_close = (cosine[:, picked] >= max_similarity).any(axis=1)
             too_close[picked] = False
             cutoff = f"; {int(too_close.sum())} candidates left out at cosine >= {max_similarity:g} to a pick"
-        log(f"\n=== Step 7. {len(recommended)} of {top_k} kept, {replaced} of them from beyond the reranker's top "
+        log(f"\n=== Step 8. {len(recommended)} of {top_k} kept, {replaced} of them from beyond the reranker's top "
             f"{len(recommended)}{cutoff}; {sum(r['like'] for r in reranked)} of {len(reranked)} candidates have "
             f"P(like) >= {THRESHOLD} ===")
         return recommended
@@ -574,8 +685,9 @@ def main():
     parser.add_argument("--top-k", type=int, default=10, help="recommendations kept after reranking")
     parser.add_argument("--mmr-lambda", type=float, default=MMR_LAMBDA,
                         help="MMR weight of P(like) against diversity, in [0, 1]; 1 keeps the reranker's order")
-    parser.add_argument("--max-similarity", type=float, default=MMR_MAX_SIMILARITY,
-                        help="a candidate whose cosine to a recommendation is this or more is left out; 2 turns it off")
+    parser.add_argument("--max-similarity", type=float, default=MAX_SIMILARITY,
+                        help="a candidate whose cosine to a history recipe or to a recommendation is this or more is "
+                             "left out; 2 turns it off")
     parser.add_argument("--output", type=Path, help="also write the recommendations to this JSON file")
     parser.add_argument("--quiet", action="store_true", help="print only the final recommendations, not each step")
     parser.add_argument("--show", type=int, default=20, help="rows printed per step")

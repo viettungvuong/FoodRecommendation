@@ -74,6 +74,11 @@ def write_artifacts(directory, seed=0, windowed=True):
     torch.save(model.state_dict(), directory / "model.pt")
 
 
+def unit(vectors):
+    """Vectors (last axis) L2-normalized."""
+    return vectors / np.linalg.norm(vectors, axis=-1, keepdims=True)
+
+
 def notebook_definitions(*names):
     """The named top-level functions and classes of the reranker notebook, run in a namespace of their own."""
     notebook = json.loads((ROOT / "model_training_reranker_avgemb.ipynb").read_text())
@@ -199,21 +204,83 @@ class RetrievalPipelineTests(unittest.TestCase):
         self.assertEqual(top["similarity"], dict(retrieved)[top["fdc_id"] - 100000])
         self.assertEqual([result["rerank_rank"] for result in results], [1, 2, 3, 4, 5])
 
-    def test_recommend_picks_from_the_reranked_candidates_with_mmr(self):
+    def test_recommend_picks_with_mmr_from_the_candidates_not_near_the_history(self):
         user = {"user_id": "u1", "history": self.history()}
         reranked = self.pipeline.recommend(user, n_candidates=12, top_k=12, mmr_lambda=1.0, max_similarity=None)
         results = self.pipeline.recommend(user, n_candidates=12, top_k=5, mmr_lambda=0.3)  # Cutoff 0.97.
-        emb = self.pipeline.recipe_index.embeddings[[result["fdc_id"] - 100000 for result in reranked]]
-        unit = emb / np.linalg.norm(emb, axis=1, keepdims=True)
-        cosine = unit @ unit.T
-        picked = retrieval.mmr([result["p_like"] for result in reranked], cosine, 5, 0.3, 0.97)
-        self.assertEqual([result["fdc_id"] for result in results], [reranked[i]["fdc_id"] for i in picked])
-        self.assertEqual(results[0]["fdc_id"], reranked[0]["fdc_id"])  # The first pick is the most likely.
+        _, history_emb = self.pipeline.resolve_history(user["history"])
+        emb = unit(self.pipeline.recipe_index.embeddings[[result["fdc_id"] - 100000 for result in reranked]])
+        # The untrained model puts most candidates within 0.97 of a history recipe; MMR picks from the rest.
+        rest = [i for i in range(len(reranked)) if (emb[i] @ unit(history_emb.numpy()).T).max() < 0.97]
+        self.assertTrue(0 < len(rest) < len(reranked))
+        cosine = emb[rest] @ emb[rest].T
+        picked = retrieval.mmr([reranked[i]["p_like"] for i in rest], cosine, 5, 0.3, 0.97)
+        self.assertEqual([result["fdc_id"] for result in results], [reranked[rest[i]]["fdc_id"] for i in picked])
+        self.assertEqual(results[0]["fdc_id"], reranked[rest[0]]["fdc_id"])  # The first pick is the most likely.
         self.assertEqual([result["rerank_rank"] for result in results], [i + 1 for i in picked])
-        self.assertLess(cosine[np.ix_(picked, picked)][np.triu_indices(len(picked), 1)].max(), 0.97)
-        # A cutoff below the lowest cosine between candidates leaves every one of them too close to the first pick.
-        lowest = cosine.min() - 1e-4
-        self.assertEqual(len(self.pipeline.recommend(user, n_candidates=12, top_k=5, max_similarity=lowest)), 1)
+        self.assertLess(cosine[np.ix_(picked, picked)][np.triu_indices(len(picked), 1)].max(initial=-1.0), 0.97)
+
+    def test_recommend_drops_catalog_recipes_nearly_identical_to_a_history_recipe(self):
+        # A home-made history recipe identical to catalog row 5 has its embedding, so HNSW retrieves row 5 too.
+        copy = {key: self.pipeline.recipes[5][key] for key in ("name", "price", "nutrients", "entities")}
+        user = {"history": [{**copy, "rating": 5, "date": "2024-01-01"}]}
+        unfiltered = self.pipeline.recommend(user, n_candidates=12, top_k=12, mmr_lambda=1.0, max_similarity=None)
+        self.assertIn(100005, [result["fdc_id"] for result in unfiltered])
+        results = self.pipeline.recommend(user, n_candidates=12, top_k=12)
+        self.assertTrue(results)
+        self.assertNotIn(100005, [result["fdc_id"] for result in results])
+        _, history_emb = self.pipeline.resolve_history(user["history"])
+        emb = unit(self.pipeline.recipe_index.embeddings[[result["fdc_id"] - 100000 for result in results]])
+        self.assertLess((emb @ unit(history_emb.numpy()).T).max(), 0.97)
+
+    # Near-duplicates of the history --------------------------------------------------------------------
+
+    def test_candidates_are_bucketed_by_similarity_most_similar_first(self):
+        candidates = [(1, 0.95), (2, 0.85), (3, 0.99), (4, 0.9), (5, 1.0), (6, 0.3), (7, -0.05)]
+        self.assertEqual(retrieval.similarity_buckets(candidates),
+                         {9: [(5, 1.0), (3, 0.99), (1, 0.95), (4, 0.9)], 8: [(2, 0.85)], 3: [(6, 0.3)],
+                          -1: [(7, -0.05)]})
+
+    def test_history_ranges_hold_every_recipe_that_close_to_the_history_recipe_and_no_narrower_range_would(self):
+        rng = np.random.default_rng(4)
+        user = unit(rng.normal(size=16))
+        history = unit(rng.normal(size=(5, 16)) + 1.5 * user)
+        ranges = retrieval.history_ranges(history @ user, 0.97)
+        self.assertEqual(sorted(position for position, _, _ in ranges), [0, 1, 2, 3, 4])
+        for position, low, high in ranges:
+            recipe = history[position]
+            near = unit(recipe + rng.normal(scale=0.06, size=(2000, 16)))  # Random directions around it.
+            near = near[near @ recipe >= 0.97]
+            self.assertGreater(len(near), 100)
+            self.assertTrue(np.all((low <= near @ user) & (near @ user <= high)))
+            # Turning the history recipe by arccos(0.97) toward or away from the user embedding reaches each end.
+            away = unit(recipe - (recipe @ user) * user)
+            angle = np.arccos(recipe @ user)
+            for turned, end in [(angle - np.arccos(0.97), high), (angle + np.arccos(0.97), low)]:
+                vector = np.cos(turned) * user + np.sin(turned) * away
+                self.assertAlmostEqual(vector @ recipe, 0.97)
+                self.assertAlmostEqual(vector @ user, end, delta=2 * retrieval.RANGE_SLACK)
+
+    def test_dropping_near_duplicates_of_the_history_matches_comparing_every_pair(self):
+        rng = np.random.default_rng(6)
+        user = unit(rng.normal(size=16))
+        history = unit(rng.normal(size=(6, 16)) + 2 * user)
+        # Noisy copies of history recipes, some within 0.97 of theirs and some not, then unrelated recipes.
+        copies = unit(history[rng.integers(0, 6, 40)] + rng.normal(scale=0.06, size=(40, 16)))
+        candidate_unit = np.concatenate([copies, unit(rng.normal(size=(60, 16)) + 2 * user)])
+        buckets = retrieval.similarity_buckets([(row, float(vector @ user)) for row, vector in enumerate(candidate_unit)])
+        self.assertGreater(len(buckets), 2)
+        kept, near = retrieval.drop_near_history(buckets, retrieval.history_ranges(history @ user, 0.97),
+                                                 candidate_unit, history, 0.97)
+        cosine = candidate_unit @ history.T
+        expected = {row for row in range(100) if cosine[row].max() >= 0.97}
+        self.assertTrue(0 < len(expected) < 40)
+        self.assertEqual(set(near), expected)
+        for row, (position, similarity) in near.items():
+            self.assertAlmostEqual(similarity, cosine[row, position], places=6)
+        # The other candidates stay in their buckets, most similar first.
+        self.assertEqual(kept, {bucket: [item for item in items if item[0] not in expected]
+                                for bucket, items in buckets.items() if any(item[0] not in expected for item in items)})
 
     # Maximal marginal relevance ------------------------------------------------------------------------
 
@@ -271,7 +338,9 @@ class RetrievalPipelineTests(unittest.TestCase):
         self.assertIs(history[0]["name"], recipe["name"])
         expected, _ = self.pipeline.reranker.encode_items([recipe])
         np.testing.assert_allclose(history_emb[0].numpy(), expected[0].numpy(), atol=1e-5)
-        self.assertEqual(len(self.pipeline.recommend({"history": [recipe]}, n_candidates=8, top_k=3)), 3)
+        # No cutoff: the untrained model puts all 8 candidates within 0.97 of the recipe.
+        self.assertEqual(len(self.pipeline.recommend({"history": [recipe]}, n_candidates=8, top_k=3,
+                                                     max_similarity=None)), 3)
 
     def test_unknown_fdc_id_and_empty_history_are_errors(self):
         with self.assertRaises(KeyError):
@@ -294,7 +363,8 @@ class RetrievalPipelineTests(unittest.TestCase):
                                        [1.5 / 1.3, -1.5 / 1.3], atol=1e-6)
             pipeline = retrieval.RetrievalPipeline(reranker, self.pipeline.recipes,
                                                    retrieval.RecipeIndex.build(reranker, self.pipeline.recipes))
-            self.assertEqual(len(pipeline.recommend({"history": self.history()}, n_candidates=6, top_k=3)), 3)
+            self.assertEqual(len(pipeline.recommend({"history": self.history()}, n_candidates=6, top_k=3,
+                                                    max_similarity=None)), 3)
 
     # Windows -------------------------------------------------------------------------------------------
 
