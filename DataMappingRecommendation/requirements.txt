@@ -1,5 +1,5 @@
-# GRU + cross-attention reranker: model_training_reranker_avgemb_approach.ipynb and
-# model_inference_reranker_avgemb_approach.py. Python 3.13.
+# GRU + cross-attention reranker: model_training_reranker_avgemb_approach.ipynb,
+# model_inference_reranker_avgemb_approach.py and retrieval_pipeline.py. Python 3.13.
 # Versions are those installed in the notebook kernel; gliner and ipywidgets are not installed there,
 # so they are the latest releases (gliner 0.2.29 pulls in transformers < 5.17).
 torch==2.14.0
@@ -12,6 +12,7 @@ ipywidgets==8.1.9
 ipython==9.17.1
 ipykernel==7.3.0
 gliner==0.2.29
+hnswlib==0.8.0
 tiktoken
 sentencepiece==0.2.2
 protobuf==7.36.2

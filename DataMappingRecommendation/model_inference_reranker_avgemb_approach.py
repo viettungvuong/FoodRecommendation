@@ -348,29 +348,49 @@ class Reranker:
                                            numeric.to(self.device))
         return item_emb, tokens
 
+    def normalized_ratings(self, history):
+        """History ratings centered on the mean of all of them, divided by the training scale (spec 2.3).
+
+        A recipe without a rating counts as the user's mean, i.e. 0."""
+        ratings = np.array([np.nan if recipe.get("rating") is None else recipe["rating"] for recipe in history],
+                           dtype=np.float64)
+        if not self.use_rating or np.isnan(ratings).all():
+            return np.zeros(len(history), dtype=np.float32)
+        return np.nan_to_num((ratings - np.nanmean(ratings)) / self.rating_scale).astype(np.float32)
+
+    @torch.no_grad()
+    def score(self, history, history_emb, candidate_emb):
+        """P(like) (C,) of candidates for the user who rated history, from item embeddings.
+
+        history is in date order and history_emb (len(history), d) holds its item embeddings; candidate_emb is
+        (C, d). Both come from encode_items or from a cache of it."""
+        t_max = self.config["t_max"]
+        # User x: the last t_max history recipes in date order go to the GRU; the profile is the mean over all.
+        recent = history_emb[-t_max:].to(self.device).unsqueeze(0)
+        history_rating = torch.as_tensor(self.normalized_ratings(history)[-t_max:], device=self.device).unsqueeze(0)
+        profile = np.mean([self.log_numeric(recipe) for recipe in history], axis=0)[-len(self.profile_mean):]
+        profile = (profile - self.profile_mean) / self.profile_std
+        keys, key_padding_mask = self.model.user_keys(
+            recent, history_rating, torch.tensor([recent.size(1)]),
+            torch.as_tensor(profile, dtype=torch.float32, device=self.device).unsqueeze(0))
+        # Recipes y: each one is a separate query, so scoring them together equals scoring them one at a time.
+        logits = self.model.score_candidates(candidate_emb.to(self.device).unsqueeze(0), keys, key_padding_mask)[0]
+        return torch.sigmoid(logits).cpu()
+
     @torch.no_grad()
     def predict(self, history, recipes):
         """P(like) of each recipe for the user who rated the recipes in history.
 
         Every recipe needs "ingredients", "price" and "nutrients" (keys of NUTRIENT_INPUTS); history recipes also
-        need "date". Ratings in the history are not a model input. Returns one dict per recipe, in order."""
+        need "date" and "rating". Returns one dict per recipe, in order."""
         if not history:
             raise ValueError("The reranker needs at least one recipe in the user's history.")
         history = sorted(history, key=lambda recipe: recipe["date"])
         self.tag_recipes([*history, *recipes])
         item_emb, tokens = self.encode_items([*history, *recipes])
-        # User x: the last t_max history recipes in date order go to the GRU; the profile is the mean over all.
-        recent = item_emb[:len(history)][-self.config["t_max"]:].unsqueeze(0)
-        history_rating = self.normalized_ratings(history)[-self.config["t_max"]:]
-        profile = (np.mean([self.log_numeric(recipe) for recipe in history], axis=0)
-                   - self.profile_mean) / self.profile_std
-        keys, key_padding_mask = self.model.user_keys(
-            recent, torch.tensor([recent.size(1)]), torch.as_tensor(profile, dtype=torch.float32,
-                                                                    device=self.device).unsqueeze(0))
-        # Recipes y: each one is a separate query, so scoring them together equals scoring them one at a time.
-        logits = self.model.score_candidates(item_emb[len(history):].unsqueeze(0), keys, key_padding_mask)[0]
+        p_likes = self.score(history, item_emb[:len(history)], item_emb[len(history):])
         results = []
-        for recipe, recipe_tokens, p_like in zip(recipes, tokens[len(history):], torch.sigmoid(logits).tolist()):
+        for recipe, recipe_tokens, p_like in zip(recipes, tokens[len(history):], p_likes.tolist()):
             results.append({"recipe": recipe, "p_like": p_like, "like": p_like >= THRESHOLD,
                             "known_tokens": sum(token in self.token_lookup for token, _ in recipe_tokens),
                             "tokens": len(recipe_tokens)})
@@ -475,7 +495,7 @@ TEST_RECIPES = [
 
 def print_predictions(user, results):
     history = sorted(user["history"], key=lambda recipe: recipe["date"])
-    print(f"User {user.get('user_id', '?')}: {len(history)} rated recipes (ratings are shown, not model inputs)")
+    print(f"User {user.get('user_id', '?')}: {len(history)} rated recipes")
     for recipe in history:
         print(f"  {recipe['date']}  rating {recipe.get('rating', '?')}  {recipe['name']}")
     print(f"  {'recipe':<42} {'P(like)':>8}  prediction  known tokens")
