@@ -1,0 +1,22 @@
+{
+  "user_id": "mixed_home_cook",
+  "history": [
+    {"fdc_id": 167657, "rating": 5, "date": "2024-01-05"},
+    {"fdc_id": 168957, "rating": 4, "date": "2024-01-22"},
+    {"fdc_id": 167694, "rating": 3, "date": "2024-02-14"},
+    {"fdc_id": 167642, "rating": 2, "date": "2024-03-03"},
+    {
+      "name": "home made beef stir fry",
+      "date": "2024-03-28",
+      "rating": 5,
+      "price": 14.5,
+      "entities": {
+        "product": [["beef"], ["soy sauce"], ["bell pepper"], ["rice"]],
+        "adj": [["red"], ["fresh"]],
+        "verb": [["sliced"], ["fried"]]
+      },
+      "nutrients": {"calories_kcal": 520, "fat_g": 18, "sugar_g": 6, "sodium_mg": 980,
+                    "protein_g": 35, "saturated_fat_g": 5, "carbohydrates_g": 55}
+    }
+  ]
+}
