@@ -83,7 +83,7 @@ recipe tokens + [price, nutrients] ──► ItemEncoder ──► item_emb (d),
              ▼                                             ▼
    candidate item_emb                   item_emb of the last T_max observed
    (the query, Phase 3)                 recipes before t, date order
-                                                           │  + their normalized centered ratings
+                                                           │  + their centered ratings in [0, 1]
                                                            ▼
                                         HistoryEncoder (GRU) ──► H = h_1 … h_T (T, d)
 
@@ -146,7 +146,7 @@ class UserEncoder(nn.Module):
 class HistoryEncoder(nn.Module):
     def __init__(self, config): ...
     def forward(self, history_emb,   # FloatTensor (B, T, d), item_emb per step, right-padded with zeros
-                history_rating,      # FloatTensor (B, T), normalized centered rating per step, 0 at padded steps
+                history_rating,      # FloatTensor (B, T), centered rating in [0, 1] per step, 0 at padded steps
                 lengths              # LongTensor (B,) on CPU, 1 <= length <= T_max
                 ) -> tuple[Tensor, Tensor]:
         # H (B, T, d), padding_mask (B, T) with True = padded step
@@ -155,7 +155,7 @@ class HistoryEncoder(nn.Module):
 - **Input:** the item embeddings and ratings of the user's last `T_max` observed recipes on days strictly before t, ascending by (`date`, `recipe_id`).
 - **Rating per step** (preprocessing, not inside the module):
   - centered: `rating - mu_before_t`, where `mu_before_t` is the mean of **all** the user's observed ratings on days strictly before t (the same set as the profile, 2.2). Not `mu_user` (1.4), which averages the target and later ratings too;
-  - normalized: divided by one global scale, the RMS of the centered ratings over the real steps of training rows. A per-user standard deviation is 0 for users who give every recipe the same rating.
+  - mapped to [0, 1]: ratings are 0–5, so the centered rating lies in [-5, 5]; `(centered + 5) / 10`. Fixed bounds need no statistics, and a per-user standard deviation would be 0 for users who give every recipe the same rating.
 - **Step input:** `item_emb + rating_projection(rating)`, with `rating_projection = nn.Linear(1, d)`.
 - **Module:** `nn.GRU(d, d, batch_first=True)`. Hidden size must be `d` so states can serve as attention keys.
 - `pack_padded_sequence(step_inputs, lengths, batch_first=True, enforce_sorted=False)` → GRU → `pad_packed_sequence(..., total_length=T)`.
@@ -219,7 +219,7 @@ candidate item_emb ─────────────► Q  (B, 1, d)   (or
 - **Baselines:** popularity (training rating count) and a constant (training positive rate).
 
 ### 3.4 Inference with the cache
-- Score from `{recipe_id: item_emb}` (2.1): cached history embeddings and their normalized centered ratings → `HistoryEncoder`; profile features → `UserEncoder`; all candidates of a user in one `score_candidates` call.
+- Score from `{recipe_id: item_emb}` (2.1): cached history embeddings and their centered ratings in [0, 1] → `HistoryEncoder`; profile features → `UserEncoder`; all candidates of a user in one `score_candidates` call.
 - Check that the cached path reproduces the forward-pass probabilities on the test rows.
 
 ---
