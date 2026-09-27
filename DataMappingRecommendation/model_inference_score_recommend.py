@@ -216,26 +216,70 @@ class RetrievalPipeline:
         recipe weighs the same under cosine similarity."""
         return F.normalize(history_emb, dim=1).mean(0)
 
-    def recommend(self, user, n_candidates=100, top_k=10):
-        """The top_k of n_candidates retrieved recipes by P(like), most likely first."""
+    def recommend(self, user, n_candidates=100, top_k=10, log=None, show=20):
+        """The top_k of n_candidates retrieved recipes by P(like), most likely first.
+
+        With log (e.g. print), each step is reported: the history, the user embedding, the HNSW candidates (the first
+        `show` of them) and how the reranker reorders them."""
+        log = log or (lambda *_: None)
         if not user.get("history"):
             raise ValueError("The pipeline needs at least one recipe in the user's history.")
+
         history, history_emb = self.resolve_history(user["history"])
+        ratings = self.reranker.normalized_ratings(history)
+        t_max = self.reranker.config["t_max"]
+        log(f"\n=== Step 1. History of user {user.get('user_id', '?')}: {len(history)} recipes, date order "
+            f"(the last {t_max} feed the GRU) ===")
+        log(f"  {'date':<10}  {'fdc_id':>8}  {'recipe':<48} {'rating':>6} {'norm. rating':>12} {'|emb|':>6}")
+        for recipe, emb, rating in zip(history, history_emb, ratings):
+            log(f"  {str(recipe.get('date', '')):<10}  {recipe.get('fdc_id', 'custom'):>8}  "
+                f"{str(recipe.get('name', ''))[:48]:<48} {str(recipe.get('rating', '-')):>6} {rating:>12.3f} "
+                f"{emb.norm():>6.2f}")
+
+        query = self.user_embedding(history_emb)
+        member_cosine = F.cosine_similarity(history_emb, query.unsqueeze(0)).tolist()
+        log(f"\n=== Step 2. Representative embedding: mean of the {len(history)} L2-normalized history embeddings "
+            f"({query.numel()} dims, norm {query.norm():.3f}) ===")
+        log("  first 8 dims: " + " ".join(f"{value:+.3f}" for value in query[:8].tolist()))
+        for recipe, cosine in zip(history, member_cosine):
+            log(f"  cosine to {str(recipe.get('name', ''))[:48]:<48} {cosine:.3f}")
+
         seen = {self.row_of[recipe["fdc_id"]] for recipe in history if "fdc_id" in recipe}
-        candidates = self.recipe_index.search(self.user_embedding(history_emb).numpy(), n_candidates, exclude=seen)
+        candidates = self.recipe_index.search(query.numpy(), n_candidates, exclude=seen)
+        log(f"\n=== Step 3. HNSW retrieval: {len(candidates)} nearest of {len(self.recipes):,} recipes by cosine "
+            f"similarity ({len(seen)} history recipes excluded) ===")
+        log(f"  {'rank':>4}  {'fdc_id':>8}  {'recipe':<56} {'cosine':>7}")
+        for rank, (row, similarity) in enumerate(candidates[:show], start=1):
+            log(f"  {rank:>4}  {self.recipes[row]['fdc_id']:>8}  {self.recipes[row]['name'][:56]:<56} {similarity:>7.3f}")
+        if len(candidates) > show:
+            log(f"  ... {len(candidates) - show} more")
         if not candidates:
             return []
+
         rows = [row for row, _ in candidates]
         p_likes = self.reranker.score(history, history_emb, torch.from_numpy(self.recipe_index.embeddings[rows]))
         results = [{"fdc_id": self.recipes[row]["fdc_id"], "name": self.recipes[row]["name"],
                     "price": self.recipes[row]["price"], "p_like": p_like, "like": p_like >= THRESHOLD,
                     "similarity": similarity, "retrieval_rank": rank}
                    for rank, ((row, similarity), p_like) in enumerate(zip(candidates, p_likes.tolist()), start=1)]
-        return sorted(results, key=lambda result: -result["p_like"])[:top_k]
+        reranked = sorted(results, key=lambda result: -result["p_like"])
+
+        log(f"\n=== Step 4. Reranker: each candidate attends over [user profile; GRU states of the last "
+            f"{min(len(history), t_max)} history recipes] -> P(like) ===")
+        log(f"  {'new':>4} {'was':>4} {'move':>5}  {'fdc_id':>8}  {'recipe':<48} {'cosine':>7} {'P(like)':>8}")
+        for new_rank, result in enumerate(reranked[:show], start=1):
+            move = result["retrieval_rank"] - new_rank
+            log(f"  {new_rank:>4} {result['retrieval_rank']:>4} {move:>+5d}  {result['fdc_id']:>8}  "
+                f"{result['name'][:48]:<48} {result['similarity']:>7.3f} {result['p_like']:>8.4f}")
+        if len(reranked) > show:
+            log(f"  ... {len(reranked) - show} more")
+        log(f"\n=== Step 5. Top {min(top_k, len(reranked))} kept; {sum(r['like'] for r in reranked)} of "
+            f"{len(reranked)} candidates have P(like) >= {THRESHOLD} ===")
+        return reranked[:top_k]
 
 
 def print_recommendations(user, results):
-    print(f"User {user.get('user_id', '?')}: {len(user['history'])} history recipes")
+    print(f"\nRecommendations for user {user.get('user_id', '?')}: {len(user['history'])} history recipes")
     print(f"  {'fdc_id':>8}  {'recipe':<60} {'P(like)':>8} {'cosine':>7} {'retrieved':>9}")
     for result in results:
         print(f"  {result['fdc_id']:>8}  {result['name'][:60]:<60} {result['p_like']:>8.4f} "
@@ -256,6 +300,8 @@ def main():
     parser.add_argument("--candidates", type=int, default=100, help="recipes retrieved by HNSW")
     parser.add_argument("--top-k", type=int, default=10, help="recommendations kept after reranking")
     parser.add_argument("--output", type=Path, help="also write the recommendations to this JSON file")
+    parser.add_argument("--quiet", action="store_true", help="print only the final recommendations, not each step")
+    parser.add_argument("--show", type=int, default=20, help="rows printed per step")
     args = parser.parse_args()
 
     pipeline = RetrievalPipeline.from_paths(args.catalog, args.artifacts, args.index_dir,
@@ -265,7 +311,8 @@ def main():
               f"in {args.index_dir}")
         return
     user = json.loads(args.user.read_text())
-    results = pipeline.recommend(user, args.candidates, args.top_k)
+    results = pipeline.recommend(user, args.candidates, args.top_k, log=None if args.quiet else print,
+                                 show=args.show)
     print_recommendations(user, results)
     if args.output:
         args.output.write_text(json.dumps({"user_id": user.get("user_id"), "recommendations": results}, indent=2))

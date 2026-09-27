@@ -1,0 +1,11 @@
+{
+  "user_id": "sweet_tooth",
+  "history": [
+    {"fdc_id": 172713, "rating": 5, "date": "2024-01-10"},
+    {"fdc_id": 167573, "rating": 5, "date": "2024-02-02"},
+    {"fdc_id": 167592, "rating": 4, "date": "2024-02-20"},
+    {"fdc_id": 167601, "rating": 4, "date": "2024-03-15"},
+    {"fdc_id": 167657, "rating": 2, "date": "2024-04-01"},
+    {"fdc_id": 168510, "rating": 1, "date": "2024-04-18"}
+  ]
+}
