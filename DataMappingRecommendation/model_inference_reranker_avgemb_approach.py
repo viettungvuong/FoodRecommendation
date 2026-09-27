@@ -1,27 +1,7 @@
-"""Classify one candidate recipe for one user with the GRU + cross-attention reranker.
+"""Predict whether a user will like a recipe with the GRU + cross-attention reranker.
 
-The weights come from model_training_reranker_avgemb_approach.ipynb (model.pt and config.json in its artifact
-folder). Every recipe, in the history and the candidate, is given as raw text: a name and its ingredient phrases.
-GLiNER tags each ingredient (as in map_recipe_nutrients.ipynb) into product / adj / verb, the reranker's text
-normalization turns those into tokens, and the model returns P(the user rates the candidate positively).
-
-    python model_inference_reranker_avgemb_approach.py                      # a randomly generated user
-    python model_inference_reranker_avgemb_approach.py --input user.json    # your own user and candidate
-    python model_inference_reranker_avgemb_approach.py --artifacts /content/drive/.../gru_xattn_reranker
-
-Input JSON (the random example prints in this form, so it can be saved and edited):
-
-    {"user_id": "demo",
-     "history": [{"name": ..., "ingredients": [...], "price": 12.5, "nutrients": {"calories (g)": ..., ...},
-                  "rating": 5, "date": "2010-03-02"}, ...],
-     "candidate": {"name": ..., "ingredients": [...], "price": ..., "nutrients": {...}, "rating": 4}}
-
-Prices and nutrients use the units of input_stage2/recipe_user_ratings_prices.csv. The history's ratings are
-shown but are not a model input (spec 2.3). The candidate's "rating" is optional: when given, it is the ground
-truth that the prediction is compared with.
-
-Requires: torch, numpy, nltk (wordnet, stopwords) and gliner (pip install gliner; the first run downloads the
-GLiNER model).
+Input: a user (their rated recipes in date order, from which the model builds the profile and history) and one or
+more recipes described by ingredients, price and nutrients. Output: P(like) for each recipe.
 """
 import argparse
 from functools import lru_cache
@@ -39,6 +19,19 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 DEFAULT_ARTIFACTS = Path(__file__).resolve().parent / "model_artifacts" / "gru_xattn_reranker"
 THRESHOLD = 0.5  # P(positive) at or above this is classified positive, as in the notebook's metrics.
+
+# Recipes here give nutrients per serving in everyday units. The training data holds Food.com's % daily value times
+# the daily value (map_recipe_nutrients.ipynb), which is 100 × the amount, except calories: Food.com gives those in
+# kcal, not % daily value, and the notebook still multiplied them by 2000. Model column → (input key, scale).
+NUTRIENT_INPUTS = {
+    "calories (g)": ("calories_kcal", 2000.0),
+    "total fat (g)": ("fat_g", 100.0),
+    "sugar (g)": ("sugar_g", 100.0),
+    "sodium (g)": ("sodium_mg", 100.0),
+    "protein (g)": ("protein_g", 100.0),
+    "saturated fat (g)": ("saturated_fat_g", 100.0),
+    "carbohydrates (g)": ("carbohydrates_g", 100.0),
+}
 
 # ---------------------------------------------------------------------------------------------------------------
 # Ingredient NER: GLiNER tags, then the rules of map_recipe_nutrients.ipynb split them into product / adj / verb.
@@ -296,12 +289,18 @@ class Reranker:
         """Lemmatize with the column's part of speech, then singularize (spec 1.1)."""
         return _lemmatizer.lemmatize(_lemmatizer.lemmatize(word, pos), "n")
 
-    def recipe_entities(self, recipe):
-        """product / adj / verb: one list of phrases per ingredient, from the NER."""
+    def tag_recipes(self, recipes):
+        """Set each untagged recipe's "entities" (product / adj / verb, one list per ingredient) with one NER pass."""
+        untagged = [recipe for recipe in recipes if "entities" not in recipe]
+        if not untagged:
+            return
         if self.tagger is None:
             self.tagger = IngredientTagger()
-        tagged = self.tagger(list(recipe["ingredients"]))
-        return {field: [ingredient[field] for ingredient in tagged] for field in self.text_fields}
+        tagged = iter(self.tagger([phrase for recipe in untagged for phrase in recipe["ingredients"]]))
+        for recipe in untagged:
+            ingredients = [next(tagged) for _ in recipe["ingredients"]]
+            recipe["entities"] = {field: [ingredient[field] for ingredient in ingredients]
+                                  for field in self.text_fields}
 
     def recipe_tokens(self, entities):
         """(token, field id) pairs, in order, each kept once (the notebook's recipe_tokens)."""
@@ -315,8 +314,10 @@ class Reranker:
         return tokens or [("<unk>", self.text_fields["product"][1])]  # An empty recipe gets one <unk>.
 
     def log_numeric(self, recipe):
-        """log1p [price, nutrients] of one recipe."""
-        values = [recipe["price"], *[recipe["nutrients"][column] for column in self.nutrient_columns]]
+        """log1p [price, nutrients] of one recipe, nutrients in the training data's units."""
+        nutrients = [recipe["nutrients"][NUTRIENT_INPUTS[column][0]] * NUTRIENT_INPUTS[column][1]
+                     for column in self.nutrient_columns]
+        values = [recipe["price"], *nutrients]
         return np.log1p(np.asarray(values, dtype=np.float64))
 
     @torch.no_grad()
@@ -337,121 +338,159 @@ class Reranker:
         return item_emb, tokens
 
     @torch.no_grad()
-    def predict(self, history, candidate):
-        """P(positive) of candidate for a user with these rated recipes, plus what went into it.
+    def predict(self, history, recipes):
+        """P(like) of each recipe for the user who rated the recipes in history.
 
-        Every recipe needs "ingredients", "price" and "nutrients"; history recipes also need "date"."""
+        Every recipe needs "ingredients", "price" and "nutrients" (keys of NUTRIENT_INPUTS); history recipes also
+        need "date". Ratings in the history are not a model input. Returns one dict per recipe, in order."""
         if not history:
-            raise ValueError("The reranker needs at least one recipe in the history.")
+            raise ValueError("The reranker needs at least one recipe in the user's history.")
         history = sorted(history, key=lambda recipe: recipe["date"])
-        recipes = [*history, candidate]
-        for recipe in recipes:
-            if "entities" not in recipe:
-                recipe["entities"] = self.recipe_entities(recipe)
-        item_emb, tokens = self.encode_items(recipes)
-        # History: the last t_max recipes in date order. Profile: the mean over all of them.
+        self.tag_recipes([*history, *recipes])
+        item_emb, tokens = self.encode_items([*history, *recipes])
+        # User x: the last t_max history recipes in date order go to the GRU; the profile is the mean over all.
         recent = item_emb[:len(history)][-self.config["t_max"]:].unsqueeze(0)
         profile = (np.mean([self.log_numeric(recipe) for recipe in history], axis=0)
                    - self.profile_mean) / self.profile_std
         keys, key_padding_mask = self.model.user_keys(
             recent, torch.tensor([recent.size(1)]), torch.as_tensor(profile, dtype=torch.float32,
                                                                     device=self.device).unsqueeze(0))
-        logit = self.model.score_candidates(item_emb[-1:].unsqueeze(0), keys, key_padding_mask)[0, 0]
-        p_positive = float(torch.sigmoid(logit))
-        return {"p_positive": p_positive, "predicted_label": int(p_positive >= THRESHOLD),
-                "history": history, "candidate": candidate, "tokens": tokens}
+        # Recipes y: each one is a separate query, so scoring them together equals scoring them one at a time.
+        logits = self.model.score_candidates(item_emb[len(history):].unsqueeze(0), keys, key_padding_mask)[0]
+        results = []
+        for recipe, recipe_tokens, p_like in zip(recipes, tokens[len(history):], torch.sigmoid(logits).tolist()):
+            results.append({"recipe": recipe, "p_like": p_like, "like": p_like >= THRESHOLD,
+                            "known_tokens": sum(token in self.token_lookup for token, _ in recipe_tokens),
+                            "tokens": len(recipe_tokens)})
+        return results
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# A randomly generated user: two rated recipes and one candidate.
+# Example users (x) and recipes to score (y). Nutrients are per serving; price is the ingredients' total in $,
+# like total_prices in the training data (median about $33).
 # ---------------------------------------------------------------------------------------------------------------
-RECIPE_POOL = [
-    {"name": "garlic ginger chicken stir fry",
-     "ingredients": ["boneless skinless chicken breasts", "soy sauce", "fresh ginger", "garlic cloves",
-                     "red bell pepper", "broccoli florets", "vegetable oil", "cornstarch"]},
-    {"name": "creamy mushroom risotto",
-     "ingredients": ["arborio rice", "sliced mushrooms", "chicken broth", "dry white wine", "unsalted butter",
-                     "grated parmesan cheese", "yellow onion", "salt and pepper"]},
-    {"name": "black bean and corn salad",
-     "ingredients": ["canned black beans", "frozen corn", "red onion", "fresh cilantro", "lime juice",
-                     "extra virgin olive oil", "ground cumin"]},
-    {"name": "classic banana bread",
-     "ingredients": ["ripe bananas", "all-purpose flour", "white sugar", "baking soda", "eggs", "melted butter",
-                     "vanilla extract", "chopped walnuts"]},
-    {"name": "spicy beef tacos",
-     "ingredients": ["lean ground beef", "taco seasoning", "flour tortillas", "shredded cheddar cheese",
-                     "diced tomatoes", "sour cream", "shredded lettuce", "hot sauce"]},
-    {"name": "lemon herb baked salmon",
-     "ingredients": ["salmon fillets", "lemon", "fresh dill", "minced garlic", "olive oil", "sea salt",
-                     "black pepper"]},
-    {"name": "chocolate chip cookies",
-     "ingredients": ["butter", "brown sugar", "white sugar", "eggs", "all-purpose flour", "baking powder",
-                     "semi-sweet chocolate chips"]},
+USERS = [
+    {"user_id": "healthy_savoury",
+     "history": [
+         {"name": "lemon herb baked salmon", "date": "2012-01-14", "rating": 5, "price": 38.5,
+          "ingredients": ["salmon fillets", "lemon", "fresh dill", "minced garlic", "olive oil", "sea salt"],
+          "nutrients": {"calories_kcal": 310, "fat_g": 18, "sugar_g": 1, "sodium_mg": 420, "protein_g": 34,
+                        "saturated_fat_g": 3, "carbohydrates_g": 3}},
+         {"name": "garlic ginger chicken stir fry", "date": "2012-02-03", "rating": 5, "price": 29.0,
+          "ingredients": ["boneless skinless chicken breasts", "soy sauce", "fresh ginger", "garlic cloves",
+                          "red bell pepper", "broccoli florets", "vegetable oil"],
+          "nutrients": {"calories_kcal": 280, "fat_g": 10, "sugar_g": 5, "sodium_mg": 890, "protein_g": 32,
+                        "saturated_fat_g": 2, "carbohydrates_g": 14}},
+         {"name": "black bean and corn salad", "date": "2012-03-20", "rating": 4, "price": 18.2,
+          "ingredients": ["canned black beans", "frozen corn", "red onion", "fresh cilantro", "lime juice",
+                          "extra virgin olive oil", "ground cumin"],
+          "nutrients": {"calories_kcal": 220, "fat_g": 7, "sugar_g": 4, "sodium_mg": 310, "protein_g": 9,
+                        "saturated_fat_g": 1, "carbohydrates_g": 33}},
+         {"name": "classic banana bread", "date": "2012-04-08", "rating": 2, "price": 21.4,
+          "ingredients": ["ripe bananas", "all-purpose flour", "white sugar", "baking soda", "eggs",
+                          "melted butter", "vanilla extract"],
+          "nutrients": {"calories_kcal": 330, "fat_g": 12, "sugar_g": 28, "sodium_mg": 260, "protein_g": 5,
+                        "saturated_fat_g": 7, "carbohydrates_g": 52}},
+         {"name": "roasted vegetable couscous", "date": "2012-05-11", "rating": 5, "price": 24.7,
+          "ingredients": ["couscous", "zucchini", "red onion", "cherry tomatoes", "chickpeas", "olive oil",
+                          "ground cumin", "fresh parsley"],
+          "nutrients": {"calories_kcal": 360, "fat_g": 11, "sugar_g": 7, "sodium_mg": 380, "protein_g": 12,
+                        "saturated_fat_g": 1.5, "carbohydrates_g": 54}},
+     ]},
+    {"user_id": "sweet_tooth_baker",
+     "history": [
+         {"name": "chocolate chip cookies", "date": "2011-11-02", "rating": 5, "price": 26.9,
+          "ingredients": ["butter", "brown sugar", "white sugar", "eggs", "all-purpose flour", "baking soda",
+                          "semi-sweet chocolate chips"],
+          "nutrients": {"calories_kcal": 210, "fat_g": 11, "sugar_g": 18, "sodium_mg": 140, "protein_g": 2,
+                        "saturated_fat_g": 6, "carbohydrates_g": 27}},
+         {"name": "classic banana bread", "date": "2011-12-18", "rating": 5, "price": 21.4,
+          "ingredients": ["ripe bananas", "all-purpose flour", "white sugar", "baking soda", "eggs",
+                          "melted butter", "vanilla extract", "chopped walnuts"],
+          "nutrients": {"calories_kcal": 360, "fat_g": 15, "sugar_g": 28, "sodium_mg": 260, "protein_g": 6,
+                        "saturated_fat_g": 7, "carbohydrates_g": 52}},
+         {"name": "new york cheesecake", "date": "2012-02-14", "rating": 5, "price": 41.3,
+          "ingredients": ["cream cheese", "white sugar", "sour cream", "eggs", "graham cracker crumbs",
+                          "melted butter", "vanilla extract", "lemon juice"],
+          "nutrients": {"calories_kcal": 520, "fat_g": 38, "sugar_g": 32, "sodium_mg": 390, "protein_g": 9,
+                        "saturated_fat_g": 22, "carbohydrates_g": 38}},
+         {"name": "spicy beef tacos", "date": "2012-03-09", "rating": 3, "price": 33.6,
+          "ingredients": ["lean ground beef", "taco seasoning", "flour tortillas", "shredded cheddar cheese",
+                          "diced tomatoes", "sour cream", "shredded lettuce"],
+          "nutrients": {"calories_kcal": 540, "fat_g": 29, "sugar_g": 4, "sodium_mg": 1120, "protein_g": 31,
+                        "saturated_fat_g": 13, "carbohydrates_g": 36}},
+         {"name": "apple crumble", "date": "2012-04-22", "rating": 4, "price": 19.8,
+          "ingredients": ["granny smith apples", "rolled oats", "brown sugar", "all-purpose flour",
+                          "cold butter", "ground cinnamon"],
+          "nutrients": {"calories_kcal": 340, "fat_g": 13, "sugar_g": 33, "sodium_mg": 95, "protein_g": 3,
+                        "saturated_fat_g": 8, "carbohydrates_g": 55}},
+     ]},
+]
+
+TEST_RECIPES = [
+    {"name": "grilled chicken quinoa bowl", "price": 31.5,
+     "ingredients": ["boneless skinless chicken breasts", "quinoa", "baby spinach", "cherry tomatoes", "cucumber",
+                     "feta cheese", "olive oil", "lemon juice"],
+     "nutrients": {"calories_kcal": 450, "fat_g": 17, "sugar_g": 5, "sodium_mg": 520, "protein_g": 38,
+                   "saturated_fat_g": 4, "carbohydrates_g": 36}},
+    {"name": "double chocolate brownies", "price": 23.9,
+     "ingredients": ["unsalted butter", "white sugar", "eggs", "cocoa powder", "all-purpose flour",
+                     "semi-sweet chocolate chips", "vanilla extract", "salt"],
+     "nutrients": {"calories_kcal": 290, "fat_g": 15, "sugar_g": 27, "sodium_mg": 110, "protein_g": 3,
+                   "saturated_fat_g": 9, "carbohydrates_g": 38}},
+    {"name": "thai green curry with tofu", "price": 27.4,
+     "ingredients": ["firm tofu", "green curry paste", "coconut milk", "green beans", "red bell pepper",
+                     "fish sauce", "fresh basil", "jasmine rice"],
+     "nutrients": {"calories_kcal": 480, "fat_g": 26, "sugar_g": 6, "sodium_mg": 780, "protein_g": 17,
+                   "saturated_fat_g": 18, "carbohydrates_g": 46}},
+    {"name": "bacon cheeseburger", "price": 36.8,
+     "ingredients": ["ground beef", "bacon", "cheddar cheese", "hamburger buns", "lettuce", "tomato",
+                     "yellow onion", "ketchup", "mayonnaise"],
+     "nutrients": {"calories_kcal": 820, "fat_g": 52, "sugar_g": 9, "sodium_mg": 1450, "protein_g": 45,
+                   "saturated_fat_g": 20, "carbohydrates_g": 42}},
+    {"name": "greek salad", "price": 19.6,
+     "ingredients": ["cucumber", "tomatoes", "red onion", "kalamata olives", "feta cheese", "dried oregano",
+                     "extra virgin olive oil", "red wine vinegar"],
+     "nutrients": {"calories_kcal": 230, "fat_g": 19, "sugar_g": 5, "sodium_mg": 610, "protein_g": 6,
+                   "saturated_fat_g": 6, "carbohydrates_g": 10}},
+    {"name": "cinnamon rolls with cream cheese frosting", "price": 28.2,
+     "ingredients": ["all-purpose flour", "active dry yeast", "milk", "brown sugar", "ground cinnamon",
+                     "softened butter", "cream cheese", "powdered sugar"],
+     "nutrients": {"calories_kcal": 480, "fat_g": 20, "sugar_g": 36, "sodium_mg": 320, "protein_g": 7,
+                   "saturated_fat_g": 12, "carbohydrates_g": 69}},
 ]
 
 
-def random_numbers(reranker, rng):
-    """Price and nutrients drawn around the training recipes' log1p mean, in the dataset's units."""
-    values = np.expm1(reranker.item_mean + reranker.item_std * np.clip(rng.normal(0, 0.5, len(reranker.item_mean)),
-                                                                       -1.5, 1.5))
-    return {"price": round(float(values[0]), 2),
-            "nutrients": {column: round(float(value), 1)
-                          for column, value in zip(reranker.nutrient_columns, values[1:])}}
-
-
-def random_example(reranker, seed):
-    rng = np.random.default_rng(seed)
-    picks = rng.choice(len(RECIPE_POOL), size=3, replace=False)
-    days = np.sort(rng.choice(np.arange(np.datetime64("2010-01-01"), np.datetime64("2012-01-01")), size=2,
-                              replace=False))
-    history = [{**RECIPE_POOL[pick], **random_numbers(reranker, rng), "rating": int(rng.integers(0, 6)),
-                "date": str(day)} for pick, day in zip(picks[:2], days)]
-    candidate = {**RECIPE_POOL[picks[2]], **random_numbers(reranker, rng)}
-    return {"user_id": f"random_user_{seed}", "history": history, "candidate": candidate}
-
-
-def describe(recipe, tokens, token_lookup):
-    known = sum(token in token_lookup for token, _ in tokens)
-    lines = [f"    ingredients: {', '.join(recipe['ingredients'])}"]
-    lines += [f"    {field:<7}  {[phrase for ingredient in recipe['entities'][field] for phrase in ingredient]}"
-              for field in recipe["entities"]]
-    lines.append(f"    tokens:  {len(tokens)}, {known} in the model's vocabulary (the rest map to <unk>)")
-    return "\n".join(lines)
+def print_predictions(user, results):
+    history = sorted(user["history"], key=lambda recipe: recipe["date"])
+    print(f"User {user.get('user_id', '?')}: {len(history)} rated recipes (ratings are shown, not model inputs)")
+    for recipe in history:
+        print(f"  {recipe['date']}  rating {recipe.get('rating', '?')}  {recipe['name']}")
+    print(f"  {'recipe':<42} {'P(like)':>8}  prediction  known tokens")
+    for result in sorted(results, key=lambda result: -result["p_like"]):
+        print(f"  {result['recipe']['name']:<42} {result['p_like']:>8.4f}  {'like' if result['like'] else 'dislike':<10}"
+              f"  {result['known_tokens']}/{result['tokens']}")
+    print()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--artifacts", type=Path, default=DEFAULT_ARTIFACTS,
                         help="folder holding model.pt and config.json")
-    parser.add_argument("--input", type=Path, help="JSON file with a user's history and a candidate")
-    parser.add_argument("--seed", type=int, default=7, help="seed of the random example (no --input)")
+    parser.add_argument("--input", type=Path,
+                        help='JSON file {"user": {"user_id", "history": [...]}, "recipes": [...]}; '
+                             "defaults to the USERS and TEST_RECIPES of this file")
     args = parser.parse_args()
 
     reranker = Reranker(args.artifacts)
     if args.input:
         example = json.loads(args.input.read_text())
+        users, recipes = [example["user"]], example["recipes"]
     else:
-        example = random_example(reranker, args.seed)
-        print("Randomly generated input (save it as JSON and pass --input to edit it):")
-        print(json.dumps(example, indent=2))
-        print()
-    result = reranker.predict(example["history"], example["candidate"])
-
-    print(f"User {example.get('user_id', '?')}: {len(result['history'])} rated recipes in the history")
-    for recipe, tokens in zip(result["history"], result["tokens"]):
-        print(f"  {recipe['date']}  rating {recipe.get('rating', '?')} (not a model input)  {recipe['name']}")
-        print(describe(recipe, tokens, reranker.token_lookup))
-    candidate = result["candidate"]
-    print(f"Candidate: {candidate['name']}")
-    print(describe(candidate, result["tokens"][-1], reranker.token_lookup))
-    print()
-    predicted = "positive" if result["predicted_label"] else "negative"
-    print(f"Prediction:   P(positive) = {result['p_positive']:.4f} → {predicted} (label "
-          f"{result['predicted_label']}, threshold {THRESHOLD})")
-    if candidate.get("rating") is not None:
-        truth = int(candidate["rating"] >= reranker.config["positive_min_rating"])
-        print(f"Ground truth: rating {candidate['rating']} → {'positive' if truth else 'negative'} (label {truth}); "
-              f"prediction {'correct' if truth == result['predicted_label'] else 'wrong'}")
+        users, recipes = USERS, TEST_RECIPES
+    print(f"P(like) at or above {THRESHOLD} → like\n")
+    for user in users:
+        print_predictions(user, reranker.predict(user["history"], recipes))
 
 
 if __name__ == "__main__":
