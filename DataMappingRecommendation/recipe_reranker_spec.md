@@ -52,7 +52,7 @@ Run the steps in this order.
 - For each user: `mu_user = mean(rating)` over their observed ratings; `rating_centered = rating - mu_user`.
 - The activity filter removes whole users, so kept users' `mu_user` is the same before and after it.
 - Sampled negatives are excluded from `mu_user` and have no `rating_centered`.
-- Neither value is a model input or target.
+- Neither value is a model input or target. The history ratings (2.3) are centered differently, on the user's mean before t, because `mu_user` also averages the target and later ratings.
 
 ### 1.5 Train / validation / test split
 - Per user, order observed ratings by (`date`, `recipe_id`). Last → test, second-to-last → validation, the rest → train.
@@ -83,7 +83,7 @@ recipe tokens + [price, nutrients] ──► ItemEncoder ──► item_emb (d),
              ▼                                             ▼
    candidate item_emb                   item_emb of the last T_max observed
    (the query, Phase 3)                 recipes before t, date order
-                                                           │
+                                                           │  + their normalized centered ratings
                                                            ▼
                                         HistoryEncoder (GRU) ──► H = h_1 … h_T (T, d)
 
@@ -146,15 +146,19 @@ class UserEncoder(nn.Module):
 class HistoryEncoder(nn.Module):
     def __init__(self, config): ...
     def forward(self, history_emb,   # FloatTensor (B, T, d), item_emb per step, right-padded with zeros
+                history_rating,      # FloatTensor (B, T), normalized centered rating per step, 0 at padded steps
                 lengths              # LongTensor (B,) on CPU, 1 <= length <= T_max
                 ) -> tuple[Tensor, Tensor]:
         # H (B, T, d), padding_mask (B, T) with True = padded step
 ```
 
-- **Input:** the item embeddings of the user's last `T_max` observed recipes on days strictly before t, ascending by (`date`, `recipe_id`).
-- Ratings are omitted from the history (decision): each step is the item embedding only.
+- **Input:** the item embeddings and ratings of the user's last `T_max` observed recipes on days strictly before t, ascending by (`date`, `recipe_id`).
+- **Rating per step** (preprocessing, not inside the module):
+  - centered: `rating - mu_before_t`, where `mu_before_t` is the mean of **all** the user's observed ratings on days strictly before t (the same set as the profile, 2.2). Not `mu_user` (1.4), which averages the target and later ratings too;
+  - normalized: divided by one global scale, the RMS of the centered ratings over the real steps of training rows. A per-user standard deviation is 0 for users who give every recipe the same rating.
+- **Step input:** `item_emb + rating_projection(rating)`, with `rating_projection = nn.Linear(1, d)`.
 - **Module:** `nn.GRU(d, d, batch_first=True)`. Hidden size must be `d` so states can serve as attention keys.
-- `pack_padded_sequence(history_emb, lengths, batch_first=True, enforce_sorted=False)` → GRU → `pad_packed_sequence(..., total_length=T)`.
+- `pack_padded_sequence(step_inputs, lengths, batch_first=True, enforce_sorted=False)` → GRU → `pad_packed_sequence(..., total_length=T)`.
 - Keep **all** hidden states `H = [h_1, …, h_T]`, not only `h_T`.
 - Return the padding mask with PyTorch's `key_padding_mask` convention (True = ignore).
 
@@ -176,9 +180,9 @@ class GRUCrossAttentionReranker(nn.Module):
         self.head = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, 1))
 
     def encode_items(self, recipe_idx) -> Tensor: ...             # (N,) → item_emb (N, d)
-    def user_keys(self, history_emb, lengths, profile): ...      # → keys (B, 1+T, d), key_padding_mask (B, 1+T)
+    def user_keys(self, history_emb, history_rating, lengths, profile): ...  # → keys (B, 1+T, d), key_padding_mask (B, 1+T)
     def score_candidates(self, candidate_emb, keys, key_padding_mask): ...  # candidate_emb (B, C, d) → logits (B, C)
-    def forward(self, candidate_idx, history_idx, lengths, profile) -> Tensor:  # → logits (B,)
+    def forward(self, candidate_idx, history_idx, history_rating, lengths, profile) -> Tensor:  # → logits (B,)
 ```
 
 ```
@@ -215,16 +219,16 @@ candidate item_emb ─────────────► Q  (B, 1, d)   (or
 - **Baselines:** popularity (training rating count) and a constant (training positive rate).
 
 ### 3.4 Inference with the cache
-- Score from `{recipe_id: item_emb}` (2.1): cached history embeddings → `HistoryEncoder`; profile features → `UserEncoder`; all candidates of a user in one `score_candidates` call.
+- Score from `{recipe_id: item_emb}` (2.1): cached history embeddings and their normalized centered ratings → `HistoryEncoder`; profile features → `UserEncoder`; all candidates of a user in one `score_candidates` call.
 - Check that the cached path reproduces the forward-pass probabilities on the test rows.
 
 ---
 
 ## Constraints (must hold)
 
-1. **No temporal leakage.** For a target on day t, the GRU sequence and `U_profile` use only observed ratings on days **strictly before** t. About 35% of kept ratings share a day with another rating of the same user, and their order within a day is unknown, so same-day ratings are excluded.
+1. **No temporal leakage.** For a target on day t, the GRU sequence (recipes and their ratings), the history rating centering and `U_profile` use only observed ratings on days **strictly before** t. About 35% of kept ratings share a day with another rating of the same user, and their order within a day is unknown, so same-day ratings are excluded.
 2. **Causal GRU states.** Since `H` is attended over, never include the target interaction (or anything after it) in `H`.
-3. **Training-split statistics only:** token vocabulary, numeric z-scores (2.1), profile z-scores (2.2) and the popularity baseline (3.3).
+3. **Training-split statistics only:** token vocabulary, numeric z-scores (2.1), profile z-scores (2.2), the history rating scale (2.3) and the popularity baseline (3.3).
 4. **Padding is masked everywhere:** text self-attention (`src_key_padding_mask`) and mean pooling, the GRU (packing), and cross-attention (`key_padding_mask`).
 5. **Sampled negatives are targets only**: never in a history, a profile or `mu_user`.
 6. **Reproducibility:** fixed seeds; every config value in one config object: `seed`, `positive_min_rating = 3`, `min_user_ratings = 6`, `negative_sampling_power`, `min_token_count`, `max_tokens`, `d`, `n_heads`, `text_layers`, `T_max`, `dropout`, `lr`, `weight_decay`, `batch_size`, `max_epochs`, `patience`, `ranking_negatives = 99`, `ndcg_k = 10`.

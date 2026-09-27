@@ -16,9 +16,10 @@ Input JSON (the random example prints in this form, so it can be saved and edite
                   "rating": 5, "date": "2010-03-02"}, ...],
      "candidate": {"name": ..., "ingredients": [...], "price": ..., "nutrients": {...}, "rating": 4}}
 
-Prices and nutrients use the units of input_stage2/recipe_user_ratings_prices.csv. The history's ratings are
-shown but are not a model input (spec 2.3). The candidate's "rating" is optional: when given, it is the ground
-truth that the prediction is compared with.
+Prices and nutrients use the units of input_stage2/recipe_user_ratings_prices.csv. Every history recipe needs its
+rating (0-5): the GRU sees it centered on the mean of the history's ratings and divided by the scale saved in
+config.json (spec 2.3). The candidate's "rating" is optional: when given, it is the ground truth that the
+prediction is compared with.
 
 Requires: torch, numpy, nltk (wordnet, stopwords) and gliner (pip install gliner; the first run downloads the
 GLiNER model).
@@ -215,15 +216,21 @@ class UserEncoder(nn.Module):
 
 
 class HistoryEncoder(nn.Module):
-    """Item embeddings of the history in date order → every GRU state H (spec 2.3). Ratings are not an input."""
+    """Item embeddings and normalized centered ratings of the history in date order → every GRU state H (spec 2.3).
 
-    def __init__(self, config):
+    use_rating=False rebuilds checkpoints trained before ratings were a history input."""
+
+    def __init__(self, config, use_rating=True):
         super().__init__()
+        self.rating_projection = nn.Linear(1, config["d"]) if use_rating else None
         self.gru = nn.GRU(config["d"], config["d"], batch_first=True)
 
-    def forward(self, history_emb, history_len):
+    def forward(self, history_emb, history_rating, history_len):
         """H (B, T, d) and its padding mask (B, T), True = padded."""
-        packed = pack_padded_sequence(history_emb, history_len.cpu(), batch_first=True, enforce_sorted=False)
+        steps_in = history_emb
+        if self.rating_projection is not None:
+            steps_in = history_emb + self.rating_projection(history_rating.unsqueeze(-1))
+        packed = pack_padded_sequence(steps_in, history_len.cpu(), batch_first=True, enforce_sorted=False)
         states, _ = pad_packed_sequence(self.gru(packed)[0], batch_first=True, total_length=history_emb.size(1))
         steps = torch.arange(history_emb.size(1), device=history_emb.device)
         return states, steps >= history_len.to(history_emb.device).unsqueeze(1)
@@ -235,20 +242,20 @@ class GRUCrossAttentionReranker(nn.Module):
     The notebook's version also holds the catalog as buffers; recipes here are new, so items are encoded
     directly with item_encoder."""
 
-    def __init__(self, vocab_size, n_numeric, n_profile, n_fields, config):
+    def __init__(self, vocab_size, n_numeric, n_profile, n_fields, config, use_rating=True):
         super().__init__()
         d = config["d"]
         self.item_encoder = ItemEncoder(vocab_size, n_numeric, n_fields, config)
         self.user_encoder = UserEncoder(n_profile, config)
-        self.history_encoder = HistoryEncoder(config)
+        self.history_encoder = HistoryEncoder(config, use_rating)
         self.key_type = nn.Embedding(2, d)  # 0: profile token, 1: GRU state.
         self.cross_attention = nn.MultiheadAttention(d, config["n_heads"], dropout=config["dropout"],
                                                      batch_first=True)
         self.head = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Dropout(config["dropout"]), nn.Linear(d, 1))
 
-    def user_keys(self, history_emb, history_len, profile):
+    def user_keys(self, history_emb, history_rating, history_len, profile):
         """Keys and values [U_profile; h_1 … h_T] (B, 1+T, d) and their padding mask (True = padded)."""
-        states, padded = self.history_encoder(history_emb, history_len)
+        states, padded = self.history_encoder(history_emb, history_rating, history_len)
         profile_token = self.user_encoder(profile).unsqueeze(1)
         keys = torch.cat([profile_token + self.key_type.weight[0], states + self.key_type.weight[1]], dim=1)
         return keys, torch.cat([padded.new_zeros(len(padded), 1), padded], dim=1)
@@ -260,7 +267,8 @@ class GRUCrossAttentionReranker(nn.Module):
         return self.head(torch.cat([attended, candidate_emb], dim=-1)).squeeze(-1)
 
 
-# Checkpoints saved before the encoders became separate classes, with nutrients only in the item embedding.
+# Checkpoints saved before the encoders became separate classes, with nutrients only in the item embedding and no
+# history ratings.
 LEGACY_KEY_PREFIXES = {"item_encoder.nutrient_projection.": "item_encoder.numeric_projection.",
                        "profile_encoder.": "user_encoder.mlp.", "gru.": "history_encoder.gru."}
 
@@ -284,9 +292,13 @@ class Reranker:
             state = {new + key[len(old):] if key.startswith(old) else key: value for key, value in state.items()}
         # 8 inputs: [price, nutrients]. Legacy checkpoints take the 7 nutrients only.
         self.n_numeric = state["item_encoder.numeric_projection.weight"].shape[1]
+        self.use_rating = "history_encoder.rating_projection.weight" in state
+        self.rating_scale = saved.get("history_rating_scale")
+        if self.use_rating and self.rating_scale is None:
+            raise ValueError("model.pt uses history ratings, but config.json has no history_rating_scale.")
         self.model = GRUCrossAttentionReranker(
             len(self.token_lookup), self.n_numeric, state["user_encoder.mlp.0.weight"].shape[1],
-            len(self.text_fields), self.config)
+            len(self.text_fields), self.config, self.use_rating)
         self.model.load_state_dict(state)
         self.model.to(self.device).eval()
         self.tagger = tagger
@@ -349,17 +361,29 @@ class Reranker:
             if "entities" not in recipe:
                 recipe["entities"] = self.recipe_entities(recipe)
         item_emb, tokens = self.encode_items(recipes)
-        # History: the last t_max recipes in date order. Profile: the mean over all of them.
+        # History: the last t_max recipes in date order, each rating centered on the mean of all the history's
+        # ratings and divided by the training scale. Profile: the mean over all of them.
         recent = item_emb[:len(history)][-self.config["t_max"]:].unsqueeze(0)
+        history_rating = self.normalized_ratings(history)[-self.config["t_max"]:]
         profile = (np.mean([self.log_numeric(recipe) for recipe in history], axis=0)
                    - self.profile_mean) / self.profile_std
         keys, key_padding_mask = self.model.user_keys(
-            recent, torch.tensor([recent.size(1)]), torch.as_tensor(profile, dtype=torch.float32,
-                                                                    device=self.device).unsqueeze(0))
+            recent, torch.as_tensor(history_rating, dtype=torch.float32, device=self.device).unsqueeze(0),
+            torch.tensor([recent.size(1)]), torch.as_tensor(profile, dtype=torch.float32,
+                                                            device=self.device).unsqueeze(0))
         logit = self.model.score_candidates(item_emb[-1:].unsqueeze(0), keys, key_padding_mask)[0, 0]
         p_positive = float(torch.sigmoid(logit))
         return {"p_positive": p_positive, "predicted_label": int(p_positive >= THRESHOLD),
-                "history": history, "candidate": candidate, "tokens": tokens}
+                "history": history, "candidate": candidate, "tokens": tokens,
+                "history_rating": self.normalized_ratings(history)}
+
+    def normalized_ratings(self, history):
+        """(rating - mean rating of the history) / the training scale, per history recipe in order. Zeros for a
+        checkpoint without history ratings (the model then ignores them)."""
+        if not self.use_rating:
+            return np.zeros(len(history))
+        ratings = np.array([recipe["rating"] for recipe in history], dtype=np.float64)
+        return (ratings - ratings.mean()) / self.rating_scale
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -438,8 +462,9 @@ def main():
     result = reranker.predict(example["history"], example["candidate"])
 
     print(f"User {example.get('user_id', '?')}: {len(result['history'])} rated recipes in the history")
-    for recipe, tokens in zip(result["history"], result["tokens"]):
-        print(f"  {recipe['date']}  rating {recipe.get('rating', '?')} (not a model input)  {recipe['name']}")
+    for recipe, tokens, normalized in zip(result["history"], result["tokens"], result["history_rating"]):
+        rating_input = f"normalized {normalized:+.3f}" if reranker.use_rating else "not used by this checkpoint"
+        print(f"  {recipe['date']}  rating {recipe.get('rating', '?')} ({rating_input})  {recipe['name']}")
         print(describe(recipe, tokens, reranker.token_lookup))
     candidate = result["candidate"]
     print(f"Candidate: {candidate['name']}")
