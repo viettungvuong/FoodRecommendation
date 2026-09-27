@@ -1,6 +1,6 @@
 """Retrieval pipeline checks on a tiny catalog and a randomly initialized reranker, without the trained weights.
 
-Run with: python3 -m unittest DataMappingRecommendation/tests/test_retrieval_pipeline.py -v
+Run with: python3 -m unittest DataMappingRecommendation/tests/test_score_recommend.py -v
 """
 import json
 from pathlib import Path
@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import model_inference_reranker_avgemb_approach as inference  # noqa: E402
-import retrieval_pipeline as retrieval  # noqa: E402
+import model_inference_score_Recommend as retrieval  # noqa: E402
 
 PRODUCTS = ["chicken breast", "salmon", "quinoa", "broccoli", "waffle", "chocolate", "lentil", "rice", "apple",
             "cheese"]
@@ -167,11 +167,11 @@ class RetrievalPipelineTests(unittest.TestCase):
         self.assertTrue({result["fdc_id"] - 100000 for result in results} <= {row for row, _ in retrieved})
         self.assertEqual([result["p_like"] for result in results],
                          sorted((result["p_like"] for result in results), reverse=True))
-        # The inference script's own path (encode everything, then score) gives the same probabilities.
+        # Encoding everything afresh, as the inference script does, gives the same probabilities as the cache.
         rows = [result["fdc_id"] - 100000 for result in results]
-        direct = self.pipeline.reranker.predict(history, [self.pipeline.recipes[row] for row in rows])
-        np.testing.assert_allclose([result["p_like"] for result in results],
-                                   [result["p_like"] for result in direct], atol=1e-5)
+        fresh, _ = self.pipeline.reranker.encode_items([*history, *(self.pipeline.recipes[row] for row in rows)])
+        direct = self.pipeline.reranker.score(history, fresh[:len(history)], fresh[len(history):])
+        np.testing.assert_allclose([result["p_like"] for result in results], direct.numpy(), atol=1e-5)
         top = max(results, key=lambda result: result["p_like"])
         self.assertEqual(top["similarity"], dict(retrieved)[top["fdc_id"] - 100000])
 
