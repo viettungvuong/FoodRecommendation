@@ -81,11 +81,13 @@ recipe tokens + [price, nutrients] ──► ItemEncoder ──► item_emb (d),
                                             │
              ┌──────────────────────────────┴──────────────┐
              ▼                                             ▼
-   candidate item_emb                   item_emb of the last T_max observed
-   (the query, Phase 3)                 recipes before t, date order
-                                                           │  + their centered ratings in [0, 1]
+   candidate item_emb                   item_emb of the observed recipes before t,
+   (the query, Phase 3)                 cut into windows at gaps >= window_gap_days
+                                        (last max_windows windows, last T_max recipes each)
+                                                           │  + their centered ratings
                                                            ▼
-                                        HistoryEncoder (GRU) ──► H = h_1 … h_T (T, d)
+                                        HistoryEncoder (GRU restarted per window)
+                                                 ──► W = w_1 … w_K (K, d), final state of each window
 
    mean [price, nutrients] of all observed recipes before t
                          │
@@ -140,26 +142,31 @@ class UserEncoder(nn.Module):
   - z-score with statistics of training rows only.
 - **Module:** `nn.Linear(n_profile, d)` → ReLU → `nn.Linear(d, d)` (or a single `nn.Linear(n_profile, d)`).
 
-### 2.3 `HistoryEncoder` (GRU states `H ∈ R^{T×d}`)
+### 2.3 `HistoryEncoder` (window states `W ∈ R^{K×d}`)
 
 ```python
 class HistoryEncoder(nn.Module):
     def __init__(self, config): ...
-    def forward(self, history_emb,   # FloatTensor (B, T, d), item_emb per step, right-padded with zeros
-                history_rating,      # FloatTensor (B, T), centered rating in [0, 1] per step, 0 at padded steps
-                lengths              # LongTensor (B,) on CPU, 1 <= length <= T_max
+    def forward(self, history_emb,   # FloatTensor (B, K, T, d), item_emb per step of each window, zeros at padding
+                history_rating,      # FloatTensor (B, K, T), centered rating per step, 0 at padded steps
+                window_len           # LongTensor (B, K) on CPU, 0 <= length <= T_max, 0 = missing window
                 ) -> tuple[Tensor, Tensor]:
-        # H (B, T, d), padding_mask (B, T) with True = padded step
+        # W (B, K, d), padding_mask (B, K) with True = missing window
 ```
 
-- **Input:** the item embeddings and ratings of the user's last `T_max` observed recipes on days strictly before t, ascending by (`date`, `recipe_id`).
+- **Windows:** the user's observed recipes on days strictly before t, ascending by (`date`, `recipe_id`), are cut
+  wherever the next rating comes `window_gap_days` (default 183, about 6 months) or more after the previous one.
+  Tastes can change over such a gap, so each window is one period. Keep the last `max_windows` windows (default 10),
+  most recent first, and in each window its last `T_max` recipes in date order. A window is a prefix of the user's
+  windows over all ratings, cut at t, so no window reaches t or later.
 - **Rating per step** (preprocessing, not inside the module):
   - centered: `rating - mu_before_t`, where `mu_before_t` is the mean of **all** the user's observed ratings on days strictly before t (the same set as the profile, 2.2). Not `mu_user` (1.4), which averages the target and later ratings too;
-  - mapped to [0, 1]: ratings are 0–5, so the centered rating lies in [-5, 5]; `(centered + 5) / 10`. Fixed bounds need no statistics, and a per-user standard deviation would be 0 for users who give every recipe the same rating.
+  - not scaled.
 - **Step input:** `item_emb + rating_projection(rating)`, with `rating_projection = nn.Linear(1, d)`.
 - **Module:** `nn.GRU(d, d, batch_first=True)`. Hidden size must be `d` so states can serve as attention keys.
-- `pack_padded_sequence(step_inputs, lengths, batch_first=True, enforce_sorted=False)` → GRU → `pad_packed_sequence(..., total_length=T)`.
-- Keep **all** hidden states `H = [h_1, …, h_T]`, not only `h_T`.
+- Each window is its own sequence: the GRU starts from a zero state in every window. Flatten (B, K) to B·K
+  sequences, drop missing windows, `pack_padded_sequence(..., enforce_sorted=False)` → GRU → the final hidden state
+  `h_n` of each window is its state `w_k`.
 - Return the padding mask with PyTorch's `key_padding_mask` convention (True = ignore).
 
 ---
@@ -175,20 +182,21 @@ class GRUCrossAttentionReranker(nn.Module):
         self.item_encoder = ItemEncoder(vocab_size, n_numeric=8, config)
         self.user_encoder = UserEncoder(n_profile=8, config)
         self.history_encoder = HistoryEncoder(config)
-        self.key_type = nn.Embedding(2, d)  # 0 = profile token, 1 = GRU state
+        self.key_type = nn.Embedding(2, d)  # 0 = profile token, 1 = window state
+        self.window_position = nn.Embedding(max_windows, d)  # 0 = most recent window
         self.cross_attention = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
         self.head = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, 1))
 
     def encode_items(self, recipe_idx) -> Tensor: ...             # (N,) → item_emb (N, d)
-    def user_keys(self, history_emb, history_rating, lengths, profile): ...  # → keys (B, 1+T, d), key_padding_mask (B, 1+T)
+    def user_keys(self, history_emb, history_rating, window_len, profile): ...  # → keys (B, 1+K, d), key_padding_mask (B, 1+K)
     def score_candidates(self, candidate_emb, keys, key_padding_mask): ...  # candidate_emb (B, C, d) → logits (B, C)
-    def forward(self, candidate_idx, history_idx, history_rating, lengths, profile) -> Tensor:  # → logits (B,)
+    def forward(self, candidate_idx, history_idx, history_rating, window_len, profile) -> Tensor:  # history_idx (B, K, T) → logits (B,)
 ```
 
 ```
 candidate item_emb ─────────────► Q  (B, 1, d)   (or (B, C, d) for C candidates)
                                    │
-[U_profile ; h_1 … h_T] + type ──► K, V  (B, 1+T, d)
+[U_profile ; w_1 … w_K] + type + recency ──► K, V  (B, 1+K, d)
                                    │
                         MultiheadAttention (+ key_padding_mask)
                                    │
@@ -200,7 +208,7 @@ candidate item_emb ─────────────► Q  (B, 1, d)   (or
 ```
 
 1. **`forward`:** encode each distinct recipe in `candidate_idx` and `history_idx` once with `item_encoder`, gather the candidate and history embeddings, then `user_keys` and `score_candidates`.
-2. **Keys / values (`user_keys`):** `concat([U_profile.unsqueeze(1), H], dim=1)` plus `key_type` (0 for the profile, 1 for GRU states). `key_padding_mask = concat([False], history padding_mask)`: the profile token is never masked.
+2. **Keys / values (`user_keys`):** `concat([U_profile.unsqueeze(1), W], dim=1)` plus `key_type` (0 for the profile, 1 for window states) and, for window states, `window_position` (0 = most recent), so the candidate can weigh recent tastes differently from old ones. `key_padding_mask = concat([False], window padding_mask)`: the profile token is never masked.
 3. **Query (`score_candidates`):** candidate `item_emb`. Several candidates per user can share one set of keys: queries attend independently, so `(B, C, d)` queries give the same scores as C separate calls.
 4. **Head:** MLP over `concat(attn_out, item_emb)` → one logit per candidate.
 5. **Output:** return **logits**. Sigmoid gives P(positive) at inference; training uses `BCEWithLogitsLoss`, which applies the sigmoid inside and is numerically stable. Do not apply sigmoid and then `BCELoss`.
@@ -219,7 +227,7 @@ candidate item_emb ─────────────► Q  (B, 1, d)   (or
 - **Baselines:** popularity (training rating count) and a constant (training positive rate).
 
 ### 3.4 Inference with the cache
-- Score from `{recipe_id: item_emb}` (2.1): cached history embeddings and their centered ratings in [0, 1] → `HistoryEncoder`; profile features → `UserEncoder`; all candidates of a user in one `score_candidates` call.
+- Score from `{recipe_id: item_emb}` (2.1): cached history embeddings, cut into windows as in 2.3, with their centered ratings → `HistoryEncoder`; profile features → `UserEncoder`; all candidates of a user in one `score_candidates` call.
 - Check that the cached path reproduces the forward-pass probabilities on the test rows.
 
 ---
@@ -227,8 +235,8 @@ candidate item_emb ─────────────► Q  (B, 1, d)   (or
 ## Constraints (must hold)
 
 1. **No temporal leakage.** For a target on day t, the GRU sequence (recipes and their ratings), the history rating centering and `U_profile` use only observed ratings on days **strictly before** t. About 35% of kept ratings share a day with another rating of the same user, and their order within a day is unknown, so same-day ratings are excluded.
-2. **Causal GRU states.** Since `H` is attended over, never include the target interaction (or anything after it) in `H`.
+2. **Causal window states.** Since `W` is attended over, never include the target interaction (or anything after it) in any window.
 3. **Training-split statistics only:** token vocabulary, numeric z-scores (2.1), profile z-scores (2.2), the history rating scale (2.3) and the popularity baseline (3.3).
 4. **Padding is masked everywhere:** text self-attention (`src_key_padding_mask`) and mean pooling, the GRU (packing), and cross-attention (`key_padding_mask`).
 5. **Sampled negatives are targets only**: never in a history, a profile or `mu_user`.
-6. **Reproducibility:** fixed seeds; every config value in one config object: `seed`, `positive_min_rating = 3`, `min_user_ratings = 6`, `negative_sampling_power`, `min_token_count`, `max_tokens`, `d`, `n_heads`, `text_layers`, `T_max`, `dropout`, `lr`, `weight_decay`, `batch_size`, `max_epochs`, `patience`, `ranking_negatives = 99`, `ndcg_k = 10`.
+6. **Reproducibility:** fixed seeds; every config value in one config object: `seed`, `positive_min_rating = 3`, `min_user_ratings = 6`, `negative_sampling_power`, `min_token_count`, `max_tokens`, `d`, `n_heads`, `text_layers`, `T_max`, `max_windows`, `window_gap_days`, `dropout`, `lr`, `weight_decay`, `batch_size`, `max_epochs`, `patience`, `ranking_negatives = 99`, `ndcg_k = 10`.

@@ -2,6 +2,8 @@
 
 Run with: python3 -m unittest DataMappingRecommendation/tests/test_score_recommend.py -v
 """
+import ast
+from types import SimpleNamespace
 import json
 from pathlib import Path
 import sys
@@ -11,6 +13,7 @@ import unittest
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -44,10 +47,14 @@ def write_catalog(path, count=40, seed=0):
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
-def write_artifacts(directory, seed=0):
-    """config.json and model.pt of an untrained reranker whose vocabulary covers the catalog's words."""
+def write_artifacts(directory, seed=0, windowed=True):
+    """config.json and model.pt of an untrained reranker whose vocabulary covers the catalog's words.
+
+    windowed=False writes the older model (one history sequence, ratings scaled by history_rating_scale)."""
     config = {"d": 16, "n_heads": 2, "text_layers": 1, "text_dropout": 0.0, "dropout": 0.0, "max_tokens": 40,
               "t_max": 4}
+    if windowed:
+        config.update(max_windows=3, window_gap_days=183)
     text_fields = {"product": ["n", 1], "adj": ["a", 2], "verb": ["v", 3]}
     nutrient_columns = list(inference.NUTRIENT_INPUTS)
     words = sorted({inference._lemmatizer.lemmatize(inference._lemmatizer.lemmatize(word, pos), "n")
@@ -55,15 +62,30 @@ def write_artifacts(directory, seed=0):
                     for phrase in phrases for word in phrase.split()})
     vocabulary = ["<pad>", "<unk>", *words]
     rng = np.random.default_rng(seed)
-    (directory / "config.json").write_text(json.dumps({
-        "config": config, "text_fields": text_fields, "nutrient_columns": nutrient_columns,
-        "vocabulary": vocabulary,
-        "item_log1p_mean": rng.uniform(1, 5, 8).tolist(), "item_log1p_std": rng.uniform(0.5, 2, 8).tolist(),
-        "profile_mean": rng.uniform(1, 5, 8).tolist(), "profile_std": rng.uniform(0.5, 2, 8).tolist(),
-        "history_rating_offset": 5.0, "history_rating_scale": 10.0}))
+    saved = {"config": config, "text_fields": text_fields, "nutrient_columns": nutrient_columns,
+             "vocabulary": vocabulary,
+             "item_log1p_mean": rng.uniform(1, 5, 8).tolist(), "item_log1p_std": rng.uniform(0.5, 2, 8).tolist(),
+             "profile_mean": rng.uniform(1, 5, 8).tolist(), "profile_std": rng.uniform(0.5, 2, 8).tolist()}
+    saved.update({"history_rating": "centered"} if windowed else {"history_rating_scale": 1.3})
+    (directory / "config.json").write_text(json.dumps(saved))
     torch.manual_seed(seed)
-    model = inference.GRUCrossAttentionReranker(len(vocabulary), 8, 8, len(text_fields), config)
+    model_class = retrieval.WindowGRUCrossAttentionReranker if windowed else inference.GRUCrossAttentionReranker
+    model = model_class(len(vocabulary), 8, 8, len(text_fields), config)
     torch.save(model.state_dict(), directory / "model.pt")
+
+
+def notebook_definitions(*names):
+    """The named top-level functions and classes of the reranker notebook, run in a namespace of their own."""
+    notebook = json.loads((ROOT / "model_training_reranker_avgemb.ipynb").read_text())
+    namespace = {"np": np, "torch": torch, "nn": torch.nn, "pack_padded_sequence": pack_padded_sequence,
+                 "pad_packed_sequence": pad_packed_sequence, "TEXT_FIELDS": {"product": 1, "adj": 2, "verb": 3}}
+    for cell in notebook["cells"]:
+        if cell["cell_type"] != "code":
+            continue
+        tree = ast.parse("".join(cell["source"]).replace("%pip", "#"))
+        nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+        exec(compile(ast.Module(nodes, type_ignores=[]), "notebook", "exec"), namespace)
+    return namespace
 
 
 class RetrievalPipelineTests(unittest.TestCase):
@@ -191,24 +213,108 @@ class RetrievalPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pipeline.recommend({"history": []})
 
-    def test_history_ratings_are_centered_on_their_mean_and_mapped_to_0_1(self):
-        # Mean of 5, 2, 5 is 4: centered 1, -2, (missing) 0, 1 → (centered + 5) / 10, as in training.
+    def test_history_ratings_are_centered_on_their_mean_and_not_scaled(self):
+        # Mean of 5, 2, 5 is 4: centered 1, -2, (missing) 0, 1.
         ratings = self.pipeline.reranker.normalized_ratings([{"rating": 5}, {"rating": 2}, {}, {"rating": 5}])
-        np.testing.assert_allclose(ratings, [0.6, 0.3, 0.5, 0.6], atol=1e-6)
-        extremes = self.pipeline.reranker.normalized_ratings([{"rating": 0}, *[{"rating": 5}] * 999])
-        self.assertTrue(((extremes >= 0) & (extremes <= 1)).all())
+        np.testing.assert_allclose(ratings, [1, -2, 0, 1], atol=1e-6)
 
-    def test_config_without_offset_keeps_the_old_scaling(self):
+    def test_config_without_windows_is_the_older_model(self):
         with tempfile.TemporaryDirectory() as other:
             other = Path(other)
-            write_artifacts(other)
-            config = json.loads((other / "config.json").read_text())
-            del config["history_rating_offset"]
-            config["history_rating_scale"] = 1.3
-            (other / "config.json").write_text(json.dumps(config))
+            write_artifacts(other, windowed=False)
             reranker = retrieval.Reranker(other, device=torch.device("cpu"))
+            self.assertFalse(reranker.windowed)
             np.testing.assert_allclose(reranker.normalized_ratings([{"rating": 5}, {"rating": 2}]),
                                        [1.5 / 1.3, -1.5 / 1.3], atol=1e-6)
+            pipeline = retrieval.RetrievalPipeline(reranker, self.pipeline.recipes,
+                                                   retrieval.RecipeIndex.build(reranker, self.pipeline.recipes))
+            self.assertEqual(len(pipeline.recommend({"history": self.history()}, n_candidates=6, top_k=3)), 3)
+
+    # Windows -------------------------------------------------------------------------------------------
+
+    def windowed_history(self):
+        """Seven ratings in three windows: gaps of 200 and 183 days start windows, 182 days does not."""
+        dates = ["2020-01-01", "2020-01-10", "2020-07-29",  # +201 days: new window.
+                 "2021-01-27",  # +182 days: same window.
+                 "2021-07-29", "2021-08-01", "2021-08-02"]  # +183 days: new window.
+        return [{"fdc_id": 100000 + row, "rating": rating, "date": date}
+                for row, rating, date in zip([1, 2, 3, 4, 5, 6, 7], [5, 4, 2, 3, 5, 5, 1], dates)]
+
+    def test_history_is_cut_into_windows_at_gaps_of_six_months(self):
+        history, _ = self.pipeline.resolve_history(self.windowed_history())
+        positions, ratings, lengths = self.pipeline.reranker.windows(history)
+        # Most recent first, in date order inside a window, trimmed to the longest window.
+        self.assertEqual(lengths.tolist(), [3, 2, 2])
+        self.assertEqual(positions.tolist(), [[4, 5, 6], [2, 3, -1], [0, 1, -1]])
+        mean = np.mean([5, 4, 2, 3, 5, 5, 1])
+        np.testing.assert_allclose(ratings[0], np.array([5, 5, 1]) - mean, atol=1e-6)
+        self.assertEqual(ratings[1, 2], 0.0)  # Padding.
+
+    def test_only_the_last_max_windows_windows_and_t_max_recipes_are_kept(self):
+        dates = [f"{2000 + year}-01-0{day}" for year in range(5) for day in range(1, 7)]  # 5 windows of 6.
+        history = [{"fdc_id": 100000 + i, "rating": 4, "date": date} for i, date in enumerate(dates)]
+        history, _ = self.pipeline.resolve_history(history)
+        positions, _, lengths = self.pipeline.reranker.windows(history)
+        self.assertEqual(lengths.tolist(), [4, 4, 4])  # max_windows = 3, t_max = 4.
+        self.assertEqual(positions[0].tolist(), [26, 27, 28, 29])
+
+    def test_windows_are_scored_from_their_own_gru_states(self):
+        history, history_emb = self.pipeline.resolve_history(self.windowed_history())
+        states = self.pipeline.reranker.window_states(history, history_emb)
+        encoder = self.pipeline.reranker.model.history_encoder
+        ratings = torch.from_numpy(self.pipeline.reranker.normalized_ratings(history))
+        with torch.no_grad():
+            for state, members in zip(states, [[4, 5, 6], [2, 3], [0, 1]]):
+                steps_in = history_emb[members] + encoder.rating_projection(ratings[members].unsqueeze(-1))
+                _, last = encoder.gru(steps_in.unsqueeze(0))  # One window alone, from a zero state.
+                np.testing.assert_allclose(state.numpy(), last[0, 0].numpy(), atol=1e-5)
+
+    def test_recommend_stores_each_window_state(self):
+        self.pipeline.recommend({"user_id": "windows", "history": self.windowed_history()}, n_candidates=6, top_k=2)
+        stored = self.pipeline.user_states["windows"]
+        self.assertEqual([window["recipes"] for window in stored["windows"]], [3, 2, 2])
+        self.assertEqual(stored["windows"][0]["from"], "2021-07-29")
+        self.assertEqual(stored["windows"][2]["fdc_ids"], [100001, 100002])
+        self.assertEqual(tuple(stored["states"].shape), (3, 16))
+
+    # Training notebook alignment -----------------------------------------------------------------------
+
+    def test_window_functions_match_the_training_notebook(self):
+        notebook = notebook_definitions("window_starts", "history_windows")
+        rng = np.random.default_rng(5)
+        users = np.sort(rng.integers(0, 6, 200))
+        days = np.concatenate([np.sort(rng.integers(0, 3000, (users == user).sum())) for user in range(6)])
+        ratings = rng.integers(0, 6, 200).astype(np.float64)
+        recipe_idx = rng.integers(0, 50, 200)
+        np.testing.assert_array_equal(retrieval.window_starts(users, days, 183), notebook["window_starts"](users, days, 183))
+        first = retrieval.window_starts(users, days, 183)
+        starts = np.searchsorted(users, users)
+        ends = np.arange(1, 201)
+        mu = rng.normal(size=200)
+        for ours, theirs in zip(retrieval.history_windows(ends, starts, mu, first, recipe_idx, ratings, 4, 5),
+                                notebook["history_windows"](ends, starts, mu, first, recipe_idx, ratings, 4, 5)):
+            np.testing.assert_array_equal(ours, theirs)
+
+    def test_model_matches_the_training_notebook(self):
+        notebook = notebook_definitions("ItemEncoder", "UserEncoder", "HistoryEncoder", "GRUCrossAttentionReranker")
+        config = {"d": 16, "n_heads": 2, "text_layers": 1, "text_dropout": 0.0, "dropout": 0.0, "max_windows": 3}
+        torch.manual_seed(3)
+        tokens = torch.randint(1, 20, (10, 6))
+        trained = notebook["GRUCrossAttentionReranker"](tokens, torch.randint(1, 4, (10, 6)), torch.randn(10, 8), 20,
+                                                        8, SimpleNamespace(**config)).eval()
+        served = retrieval.WindowGRUCrossAttentionReranker(20, 8, 8, 3, config).eval()
+        served.load_state_dict(trained.state_dict())  # Same parameter names and shapes.
+        history_idx = torch.tensor([[[1, 2, 3], [4, -1, -1]], [[5, 6, -1], [-1, -1, -1]]])
+        rating = torch.randn(2, 2, 3) * (history_idx >= 0)
+        window_len = torch.tensor([[3, 1], [2, 0]])
+        profile = torch.randn(2, 8)
+        with torch.no_grad():
+            expected = trained(torch.tensor([7, 8]), history_idx, rating, window_len, profile)
+            emb = trained.encode_items(torch.arange(10))
+            keys, mask = served.user_keys(emb[history_idx.clamp(min=0)] * (history_idx >= 0).unsqueeze(-1), rating,
+                                          window_len, profile)
+            got = served.score_candidates(emb[[7, 8]].unsqueeze(1), keys, mask).squeeze(1)
+        np.testing.assert_allclose(got.numpy(), expected.numpy(), atol=1e-5)
 
 if __name__ == "__main__":
     unittest.main()
