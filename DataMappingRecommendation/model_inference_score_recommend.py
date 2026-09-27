@@ -28,7 +28,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence
 
-from model_inference_reranker_avgemb_approach import (DEFAULT_ARTIFACTS, THRESHOLD, ItemEncoder, Reranker as BaseReranker,
+from model_inference_reranker_avgemb import (DEFAULT_ARTIFACTS, THRESHOLD, ItemEncoder, Reranker as BaseReranker,
                                                      UserEncoder)
 
 HERE = Path(__file__).resolve().parent
