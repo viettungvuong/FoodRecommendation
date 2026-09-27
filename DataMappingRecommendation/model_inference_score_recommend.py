@@ -9,8 +9,8 @@
    approach.py does, and the candidates are sorted by P(like).
 
 Usage:
-    python model_inference_score_Recommend.py build --catalog path/to/price_mapped_nutrients.csv
-    python model_inference_score_Recommend.py recommend --catalog path/to/price_mapped_nutrients.csv \\
+    python model_inference_score_recommend.py build --catalog path/to/price_mapped_nutrients.csv
+    python model_inference_score_recommend.py recommend --catalog path/to/price_mapped_nutrients.csv \\
         --user examples/retrieval_user.json
 """
 import argparse

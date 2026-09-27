@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import model_inference_reranker_avgemb_approach as inference  # noqa: E402
-import model_inference_score_Recommend as retrieval  # noqa: E402
+import model_inference_score_recommend as retrieval  # noqa: E402
 
 PRODUCTS = ["chicken breast", "salmon", "quinoa", "broccoli", "waffle", "chocolate", "lentil", "rice", "apple",
             "cheese"]
