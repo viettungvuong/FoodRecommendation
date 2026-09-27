@@ -45,15 +45,23 @@ SEED = 42
 class Reranker(BaseReranker):
     """The reranker of model_inference_reranker_avgemb_approach.py, scoring candidates from item embeddings."""
 
-    def normalized_ratings(self, history):
-        """History ratings centered on the mean of all of them, divided by the training scale (spec 2.3).
+    def __init__(self, artifact_dir=DEFAULT_ARTIFACTS, tagger=None, device=None):
+        super().__init__(artifact_dir, tagger, device)
+        # Models trained with [0, 1] history ratings save offset 5 and scale 10; older ones only a scale (offset 0).
+        saved = json.loads((Path(artifact_dir) / "config.json").read_text())
+        self.rating_offset = saved.get("history_rating_offset", 0.0)
 
-        A recipe without a rating counts as the user's mean, i.e. 0."""
+    def normalized_ratings(self, history):
+        """History ratings as the GRU saw them in training (spec 2.3): centered on the mean of all of them, then
+        (centered + offset) / scale, which is [0, 1] for offset 5 and scale 10.
+
+        A recipe without a rating counts as the user's mean, i.e. centered 0."""
+        if not self.use_rating:
+            return np.zeros(len(history), dtype=np.float32)  # The model has no rating input.
         ratings = np.array([np.nan if recipe.get("rating") is None else recipe["rating"] for recipe in history],
                            dtype=np.float64)
-        if not self.use_rating or np.isnan(ratings).all():
-            return np.zeros(len(history), dtype=np.float32)
-        return np.nan_to_num((ratings - np.nanmean(ratings)) / self.rating_scale).astype(np.float32)
+        centered = np.zeros(len(history)) if np.isnan(ratings).all() else np.nan_to_num(ratings - np.nanmean(ratings))
+        return ((centered + self.rating_offset) / self.rating_scale).astype(np.float32)
 
     @torch.no_grad()
     def score(self, history, history_emb, candidate_emb):
@@ -230,7 +238,7 @@ class RetrievalPipeline:
         t_max = self.reranker.config["t_max"]
         log(f"\n=== Step 1. History of user {user.get('user_id', '?')}: {len(history)} recipes, date order "
             f"(the last {t_max} feed the GRU) ===")
-        log(f"  {'date':<10}  {'fdc_id':>8}  {'recipe':<48} {'rating':>6} {'norm. rating':>12} {'|emb|':>6}")
+        log(f"  {'date':<10}  {'fdc_id':>8}  {'recipe':<48} {'rating':>6} {'model rating':>12} {'|emb|':>6}")
         for recipe, emb, rating in zip(history, history_emb, ratings):
             log(f"  {str(recipe.get('date', '')):<10}  {recipe.get('fdc_id', 'custom'):>8}  "
                 f"{str(recipe.get('name', ''))[:48]:<48} {str(recipe.get('rating', '-')):>6} {rating:>12.3f} "

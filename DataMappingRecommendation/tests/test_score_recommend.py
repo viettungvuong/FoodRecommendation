@@ -60,7 +60,7 @@ def write_artifacts(directory, seed=0):
         "vocabulary": vocabulary,
         "item_log1p_mean": rng.uniform(1, 5, 8).tolist(), "item_log1p_std": rng.uniform(0.5, 2, 8).tolist(),
         "profile_mean": rng.uniform(1, 5, 8).tolist(), "profile_std": rng.uniform(0.5, 2, 8).tolist(),
-        "history_rating_scale": 1.3}))
+        "history_rating_offset": 5.0, "history_rating_scale": 10.0}))
     torch.manual_seed(seed)
     model = inference.GRUCrossAttentionReranker(len(vocabulary), 8, 8, len(text_fields), config)
     torch.save(model.state_dict(), directory / "model.pt")
@@ -191,10 +191,24 @@ class RetrievalPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pipeline.recommend({"history": []})
 
-    def test_history_ratings_are_centered_on_their_mean_and_scaled(self):
+    def test_history_ratings_are_centered_on_their_mean_and_mapped_to_0_1(self):
+        # Mean of 5, 2, 5 is 4: centered 1, -2, (missing) 0, 1 → (centered + 5) / 10, as in training.
         ratings = self.pipeline.reranker.normalized_ratings([{"rating": 5}, {"rating": 2}, {}, {"rating": 5}])
-        np.testing.assert_allclose(ratings, [1 / 1.3, -2 / 1.3, 0, 1 / 1.3], atol=1e-6)
+        np.testing.assert_allclose(ratings, [0.6, 0.3, 0.5, 0.6], atol=1e-6)
+        extremes = self.pipeline.reranker.normalized_ratings([{"rating": 0}, *[{"rating": 5}] * 999])
+        self.assertTrue(((extremes >= 0) & (extremes <= 1)).all())
 
+    def test_config_without_offset_keeps_the_old_scaling(self):
+        with tempfile.TemporaryDirectory() as other:
+            other = Path(other)
+            write_artifacts(other)
+            config = json.loads((other / "config.json").read_text())
+            del config["history_rating_offset"]
+            config["history_rating_scale"] = 1.3
+            (other / "config.json").write_text(json.dumps(config))
+            reranker = retrieval.Reranker(other, device=torch.device("cpu"))
+            np.testing.assert_allclose(reranker.normalized_ratings([{"rating": 5}, {"rating": 2}]),
+                                       [1.5 / 1.3, -1.5 / 1.3], atol=1e-6)
 
 if __name__ == "__main__":
     unittest.main()
