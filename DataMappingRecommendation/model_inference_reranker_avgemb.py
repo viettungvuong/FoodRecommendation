@@ -1,7 +1,11 @@
 """Predict whether a user will like a recipe with the GRU + cross-attention reranker.
 
-Input: a user (their rated recipes in date order, from which the model builds the profile and history) and one or
+Input: a user (their rated recipes with dates, from which the model builds the profile and history) and one or
 more recipes described by ingredients, price and nutrients. Output: P(like) for each recipe.
+
+The model of model_training_reranker_avgemb.ipynb cuts the history into windows wherever two ratings are
+window_gap_days (about 6 months) or more apart, runs the GRU over each window from a fresh state and lets each
+recipe attend over [user profile; the final state of each window]. Ratings are centered on the user's mean.
 """
 import argparse
 from functools import lru_cache
@@ -171,7 +175,7 @@ class IngredientTagger:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# The model: the classes of model_training_reranker_avgemb_approach.ipynb.
+# The model: the classes of model_training_reranker_avgemb.ipynb.
 # ---------------------------------------------------------------------------------------------------------------
 class ItemEncoder(nn.Module):
     """Recipe tokens and [price, nutrients] → item_emb (spec 2.1)."""
@@ -259,6 +263,107 @@ class GRUCrossAttentionReranker(nn.Module):
         return self.head(torch.cat([attended, candidate_emb], dim=-1)).squeeze(-1)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# History windows: the same functions as model_training_reranker_avgemb.ipynb, so serving cuts the history
+# exactly as training did.
+# ---------------------------------------------------------------------------------------------------------------
+def window_starts(user_codes, days, gap_days):
+    """Index of the first rating of each rating's window. Rows are sorted by user, then day. A window ends where
+    the user changes or where the next rating comes gap_days or more after the previous one."""
+    new_window = np.ones(len(days), dtype=bool)
+    new_window[1:] = (user_codes[1:] != user_codes[:-1]) | (np.diff(days) >= gap_days)
+    return np.maximum.accumulate(np.where(new_window, np.arange(len(days)), 0))
+
+
+def history_windows(prior_end, user_start, mu_before, first_of_window, recipe_idx, ratings, max_windows, t_max):
+    """Each row's history as windows, most recent window first.
+
+    A row's history is ratings[user_start:prior_end]. Returns recipe indices (B, max_windows, t_max), -1 at padding;
+    ratings centered on mu_before (B, max_windows, t_max), 0 at padding; window lengths (B, max_windows), 0 for
+    missing windows. Each window keeps its last t_max ratings, in date order."""
+    steps = np.arange(t_max)
+    history_idx = np.full((len(prior_end), max_windows, t_max), -1, dtype=np.int64)
+    history_rating = np.zeros((len(prior_end), max_windows, t_max), dtype=np.float32)
+    window_len = np.zeros((len(prior_end), max_windows), dtype=np.int64)
+    ends = np.asarray(prior_end, dtype=np.int64).copy()
+    for k in range(max_windows):
+        alive = ends > user_start
+        if not alive.any():
+            break
+        # The window of the last rating before `ends`; it never reaches before user_start (a user change starts one).
+        starts = np.where(alive, first_of_window[np.maximum(ends - 1, 0)], ends)
+        length = np.minimum(ends - starts, t_max)
+        positions = np.clip(ends[:, None] - length[:, None] + steps, 0, len(recipe_idx) - 1)
+        real = steps < length[:, None]
+        history_idx[:, k] = np.where(real, recipe_idx[positions], -1)
+        history_rating[:, k] = np.where(real, ratings[positions] - mu_before[:, None], 0.0)
+        window_len[:, k] = length
+        ends = starts
+    return history_idx, history_rating, window_len
+
+
+def history_day(value):
+    """Day number (days since 1970-01-01) of a history date such as "2024-01-31"; a missing date is day 0."""
+    if value is None or value == "":
+        return 0
+    return int(np.datetime64(str(value)[:10], "D").astype(np.int64))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The windowed model: the HistoryEncoder and GRUCrossAttentionReranker of the notebook (same parameter names).
+# ---------------------------------------------------------------------------------------------------------------
+class WindowHistoryEncoder(nn.Module):
+    """History windows → the final GRU state of each window; the GRU restarts from zero in every window."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.rating_projection = nn.Linear(1, config["d"])
+        self.gru = nn.GRU(config["d"], config["d"], batch_first=True)
+
+    def forward(self, history_emb, history_rating, window_len):
+        """Window states (B, K, d) and their padding mask (B, K), True = missing window."""
+        batch, windows, steps, d = history_emb.shape
+        steps_in = (history_emb + self.rating_projection(history_rating.unsqueeze(-1))).reshape(-1, steps, d)
+        lengths = window_len.reshape(-1).cpu()
+        real = lengths > 0
+        packed = pack_padded_sequence(steps_in[real.to(steps_in.device)], lengths[real], batch_first=True,
+                                      enforce_sorted=False)
+        _, last = self.gru(packed)  # (1, windows, d): each window's state after its last real step.
+        states = steps_in.new_zeros(batch * windows, d)
+        states[real.to(states.device)] = last[0]
+        return states.view(batch, windows, d), (window_len == 0).to(history_emb.device)
+
+
+class WindowGRUCrossAttentionReranker(nn.Module):
+    """Candidate item_emb cross-attends over [U_profile; w_1 … w_K], w_1 the most recent window's state."""
+
+    def __init__(self, vocab_size, n_numeric, n_profile, n_fields, config):
+        super().__init__()
+        d = config["d"]
+        self.item_encoder = ItemEncoder(vocab_size, n_numeric, n_fields, config)
+        self.user_encoder = UserEncoder(n_profile, config)
+        self.history_encoder = WindowHistoryEncoder(config)
+        self.key_type = nn.Embedding(2, d)  # 0: profile token, 1: window state.
+        self.window_position = nn.Embedding(config["max_windows"], d)  # 0: most recent window.
+        self.cross_attention = nn.MultiheadAttention(d, config["n_heads"], dropout=config["dropout"],
+                                                     batch_first=True)
+        self.head = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Dropout(config["dropout"]), nn.Linear(d, 1))
+
+    def user_keys(self, history_emb, history_rating, window_len, profile):
+        """Keys and values [U_profile; w_1 … w_K] (B, 1+K, d) and their padding mask (True = padded)."""
+        states, padded = self.history_encoder(history_emb, history_rating, window_len)
+        states = states + self.window_position.weight[:states.size(1)] + self.key_type.weight[1]
+        profile_token = self.user_encoder(profile).unsqueeze(1) + self.key_type.weight[0]
+        keys = torch.cat([profile_token, states], dim=1)
+        return keys, torch.cat([padded.new_zeros(len(padded), 1), padded], dim=1)
+
+    def score_candidates(self, candidate_emb, keys, key_padding_mask):
+        """Logits (B, C) for candidates (B, C, d)."""
+        attended, _ = self.cross_attention(candidate_emb, keys, keys, key_padding_mask=key_padding_mask,
+                                           need_weights=False)
+        return self.head(torch.cat([attended, candidate_emb], dim=-1)).squeeze(-1)
+
+
 # Checkpoints saved before the encoders became separate classes, with nutrients only in the item embedding and no
 # history ratings.
 LEGACY_KEY_PREFIXES = {"item_encoder.nutrient_projection.": "item_encoder.numeric_projection.",
@@ -266,7 +371,11 @@ LEGACY_KEY_PREFIXES = {"item_encoder.nutrient_projection.": "item_encoder.numeri
 
 
 class Reranker:
-    """The trained model with the vocabulary and normalization statistics saved next to it."""
+    """The trained model with the vocabulary and normalization statistics saved next to it.
+
+    A config.json with max_windows is the windowed model of model_training_reranker_avgemb.ipynb: history cut into
+    windows at gaps of window_gap_days or more, centered ratings, one key per window. Otherwise it is an older model:
+    the last t_max recipes in one sequence."""
 
     def __init__(self, artifact_dir=DEFAULT_ARTIFACTS, tagger=None, device=None):
         artifact_dir = Path(artifact_dir)
@@ -278,19 +387,28 @@ class Reranker:
         self.item_mean, self.item_std = np.array(saved["item_log1p_mean"]), np.array(saved["item_log1p_std"])
         self.profile_mean, self.profile_std = np.array(saved["profile_mean"]), np.array(saved["profile_std"])
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.windowed = "max_windows" in self.config
 
         state = torch.load(artifact_dir / "model.pt", map_location="cpu", weights_only=True)
         for old, new in LEGACY_KEY_PREFIXES.items():
             state = {new + key[len(old):] if key.startswith(old) else key: value for key, value in state.items()}
         # 8 inputs: [price, nutrients]. Legacy checkpoints take the 7 nutrients only.
         self.n_numeric = state["item_encoder.numeric_projection.weight"].shape[1]
+        n_profile = state["user_encoder.mlp.0.weight"].shape[1]
         self.use_rating = "history_encoder.rating_projection.weight" in state
-        self.rating_scale = saved.get("history_rating_scale")
-        if self.use_rating and self.rating_scale is None:
-            raise ValueError("model.pt uses history ratings, but config.json has no history_rating_scale.")
-        self.model = GRUCrossAttentionReranker(
-            len(self.token_lookup), self.n_numeric, state["user_encoder.mlp.0.weight"].shape[1],
-            len(self.text_fields), self.config, self.use_rating)
+        if self.windowed:
+            # History ratings are centered on the mean rating before t, not scaled.
+            self.rating_offset, self.rating_scale = 0.0, 1.0
+            self.model = WindowGRUCrossAttentionReranker(len(self.token_lookup), self.n_numeric, n_profile,
+                                                         len(self.text_fields), self.config)
+        else:
+            # Older models: (centered + offset) / scale, offset 5 and scale 10 for [0, 1] ratings, else offset 0.
+            self.rating_offset = saved.get("history_rating_offset", 0.0)
+            self.rating_scale = saved.get("history_rating_scale")
+            if self.use_rating and self.rating_scale is None:
+                raise ValueError("model.pt uses history ratings, but config.json has no history_rating_scale.")
+            self.model = GRUCrossAttentionReranker(len(self.token_lookup), self.n_numeric, n_profile,
+                                                   len(self.text_fields), self.config, self.use_rating)
         self.model.load_state_dict(state)
         self.model.to(self.device).eval()
         self.tagger = tagger
@@ -348,29 +466,85 @@ class Reranker:
                                            numeric.to(self.device))
         return item_emb, tokens
 
+    def normalized_ratings(self, history):
+        """History ratings as the GRU saw them in training (spec 2.3): centered on the mean of all of them, then
+        (centered + offset) / scale. The windowed model uses them centered only (offset 0, scale 1).
+
+        A recipe without a rating counts as the user's mean, i.e. centered 0."""
+        if not self.use_rating:
+            return np.zeros(len(history), dtype=np.float32)  # The model has no rating input.
+        ratings = np.array([np.nan if recipe.get("rating") is None else recipe["rating"] for recipe in history],
+                           dtype=np.float64)
+        centered = np.zeros(len(history)) if np.isnan(ratings).all() else np.nan_to_num(ratings - np.nanmean(ratings))
+        return ((centered + self.rating_offset) / self.rating_scale).astype(np.float32)
+
+    def windows(self, history):
+        """The windows of history (date order) that the GRU sees, most recent first: positions into history (K, T),
+        -1 at padding; centered ratings (K, T); lengths (K,)."""
+        centered = self.normalized_ratings(history).astype(np.float64)  # Centered, missing ratings 0.
+        days = np.array([history_day(recipe.get("date")) for recipe in history], dtype=np.int64)
+        count = len(history)
+        positions, ratings, lengths = history_windows(
+            np.array([count]), np.array([0]), np.array([0.0]),
+            window_starts(np.zeros(count, dtype=np.int64), days, self.config["window_gap_days"]), np.arange(count),
+            centered, self.config["max_windows"], self.config["t_max"])
+        windows, steps = int((lengths[0] > 0).sum()), int(lengths[0].max())
+        return positions[0, :windows, :steps], ratings[0, :windows, :steps], lengths[0, :windows]
+
+    def _profile(self, history):
+        profile = np.mean([self.log_numeric(recipe) for recipe in history], axis=0)[-len(self.profile_mean):]
+        profile = (profile - self.profile_mean) / self.profile_std
+        return torch.as_tensor(profile, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+    def _window_inputs(self, history, history_emb):
+        positions, ratings, lengths = self.windows(history)
+        positions = torch.from_numpy(positions)
+        window_emb = history_emb[positions.clamp(min=0)] * (positions >= 0).unsqueeze(-1)
+        return (window_emb.unsqueeze(0).to(self.device), torch.from_numpy(ratings).unsqueeze(0).to(self.device),
+                torch.from_numpy(lengths).unsqueeze(0))
+
+    @torch.no_grad()
+    def window_states(self, history, history_emb):
+        """The hidden state (K, d) of each window of the windowed model, most recent first."""
+        states, _ = self.model.history_encoder(*self._window_inputs(history, history_emb))
+        return states[0].cpu()
+
+    @torch.no_grad()
+    def user_keys(self, history, history_emb):
+        """The user's attention keys and their padding mask, for history (date order) and its item embeddings."""
+        if self.windowed:
+            return self.model.user_keys(*self._window_inputs(history, history_emb), self._profile(history))
+        # Older model: the last t_max history recipes in date order go to the GRU as one sequence.
+        t_max = self.config["t_max"]
+        recent = history_emb[-t_max:].to(self.device).unsqueeze(0)
+        history_rating = torch.as_tensor(self.normalized_ratings(history)[-t_max:], device=self.device).unsqueeze(0)
+        return self.model.user_keys(recent, history_rating, torch.tensor([recent.size(1)]), self._profile(history))
+
+    @torch.no_grad()
+    def score(self, history, history_emb, candidate_emb):
+        """P(like) (C,) of candidates for the user who rated history, from item embeddings.
+
+        history is in date order and history_emb (len(history), d) holds its item embeddings; candidate_emb is
+        (C, d). Both come from encode_items or from the index's cache of it. The profile is the mean over all."""
+        keys, key_padding_mask = self.user_keys(history, history_emb)
+        # Each candidate is a separate query, so scoring them together equals scoring them one at a time.
+        logits = self.model.score_candidates(candidate_emb.to(self.device).unsqueeze(0), keys, key_padding_mask)[0]
+        return torch.sigmoid(logits).cpu()
+
     @torch.no_grad()
     def predict(self, history, recipes):
         """P(like) of each recipe for the user who rated the recipes in history.
 
-        Every recipe needs "ingredients", "price" and "nutrients" (keys of NUTRIENT_INPUTS); history recipes also
-        need "date". Ratings in the history are not a model input. Returns one dict per recipe, in order."""
+        Every recipe needs "ingredients" (or "entities"), "price" and "nutrients" (keys of NUTRIENT_INPUTS); history
+        recipes also need "date" and "rating". Returns one dict per recipe, in order."""
         if not history:
             raise ValueError("The reranker needs at least one recipe in the user's history.")
-        history = sorted(history, key=lambda recipe: recipe["date"])
+        history = sorted(history, key=lambda recipe: str(recipe.get("date", "")))
         self.tag_recipes([*history, *recipes])
         item_emb, tokens = self.encode_items([*history, *recipes])
-        # User x: the last t_max history recipes in date order go to the GRU; the profile is the mean over all.
-        recent = item_emb[:len(history)][-self.config["t_max"]:].unsqueeze(0)
-        history_rating = self.normalized_ratings(history)[-self.config["t_max"]:]
-        profile = (np.mean([self.log_numeric(recipe) for recipe in history], axis=0)
-                   - self.profile_mean) / self.profile_std
-        keys, key_padding_mask = self.model.user_keys(
-            recent, torch.tensor([recent.size(1)]), torch.as_tensor(profile, dtype=torch.float32,
-                                                                    device=self.device).unsqueeze(0))
-        # Recipes y: each one is a separate query, so scoring them together equals scoring them one at a time.
-        logits = self.model.score_candidates(item_emb[len(history):].unsqueeze(0), keys, key_padding_mask)[0]
+        p_likes = self.score(history, item_emb[:len(history)], item_emb[len(history):])
         results = []
-        for recipe, recipe_tokens, p_like in zip(recipes, tokens[len(history):], torch.sigmoid(logits).tolist()):
+        for recipe, recipe_tokens, p_like in zip(recipes, tokens[len(history):], p_likes.tolist()):
             results.append({"recipe": recipe, "p_like": p_like, "like": p_like >= THRESHOLD,
                             "known_tokens": sum(token in self.token_lookup for token, _ in recipe_tokens),
                             "tokens": len(recipe_tokens)})
@@ -473,11 +647,17 @@ TEST_RECIPES = [
 ]
 
 
-def print_predictions(user, results):
-    history = sorted(user["history"], key=lambda recipe: recipe["date"])
-    print(f"User {user.get('user_id', '?')}: {len(history)} rated recipes (ratings are shown, not model inputs)")
-    for recipe in history:
-        print(f"  {recipe['date']}  rating {recipe.get('rating', '?')}  {recipe['name']}")
+def print_predictions(reranker, user, results):
+    history = sorted(user["history"], key=lambda recipe: str(recipe.get("date", "")))
+    window_of = {}  # History position → window number (1 = most recent), for the recipes the GRU sees.
+    if reranker.windowed:
+        positions, _, _ = reranker.windows(history)
+        window_of = {int(position): window + 1 for window, row in enumerate(positions) for position in row
+                     if position >= 0}
+    print(f"User {user.get('user_id', '?')}: {len(history)} rated recipes")
+    for position, recipe in enumerate(history):
+        window = f"  window {window_of.get(position, '-')}" if reranker.windowed else ""
+        print(f"  {recipe.get('date', '')}  rating {recipe.get('rating', '?')}{window}  {recipe['name']}")
     print(f"  {'recipe':<42} {'P(like)':>8}  prediction  known tokens")
     for result in sorted(results, key=lambda result: -result["p_like"]):
         print(f"  {result['recipe']['name']:<42} {result['p_like']:>8.4f}  {'like' if result['like'] else 'dislike':<10}"
@@ -502,7 +682,7 @@ def main():
         users, recipes = USERS, TEST_RECIPES
     print(f"P(like) at or above {THRESHOLD} → like\n")
     for user in users:
-        print_predictions(user, reranker.predict(user["history"], recipes))
+        print_predictions(reranker, user, reranker.predict(user["history"], recipes))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import model_inference_reranker_avgemb_approach as inference  # noqa: E402
+import model_inference_reranker_avgemb as inference  # noqa: E402
 import model_inference_score_recommend as retrieval  # noqa: E402
 
 PRODUCTS = ["chicken breast", "salmon", "quinoa", "broccoli", "waffle", "chocolate", "lentil", "rice", "apple",
@@ -69,7 +69,7 @@ def write_artifacts(directory, seed=0, windowed=True):
     saved.update({"history_rating": "centered"} if windowed else {"history_rating_scale": 1.3})
     (directory / "config.json").write_text(json.dumps(saved))
     torch.manual_seed(seed)
-    model_class = retrieval.WindowGRUCrossAttentionReranker if windowed else inference.GRUCrossAttentionReranker
+    model_class = inference.WindowGRUCrossAttentionReranker if windowed else inference.GRUCrossAttentionReranker
     model = model_class(len(vocabulary), 8, 8, len(text_fields), config)
     torch.save(model.state_dict(), directory / "model.pt")
 
@@ -277,6 +277,14 @@ class RetrievalPipelineTests(unittest.TestCase):
         self.assertEqual(stored["windows"][2]["fdc_ids"], [100001, 100002])
         self.assertEqual(tuple(stored["states"].shape), (3, 16))
 
+    def test_inference_script_predict_uses_the_windows(self):
+        history, history_emb = self.pipeline.resolve_history(self.windowed_history())
+        recipes = [self.pipeline.recipes[row] for row in (10, 20, 30)]
+        results = self.pipeline.reranker.predict(list(reversed(history)), recipes)  # predict sorts by date itself.
+        expected = self.pipeline.reranker.score(history, history_emb,
+                                                torch.from_numpy(self.pipeline.recipe_index.embeddings[[10, 20, 30]]))
+        np.testing.assert_allclose([result["p_like"] for result in results], expected.numpy(), atol=1e-5)
+
     # Training notebook alignment -----------------------------------------------------------------------
 
     def test_window_functions_match_the_training_notebook(self):
@@ -286,12 +294,12 @@ class RetrievalPipelineTests(unittest.TestCase):
         days = np.concatenate([np.sort(rng.integers(0, 3000, (users == user).sum())) for user in range(6)])
         ratings = rng.integers(0, 6, 200).astype(np.float64)
         recipe_idx = rng.integers(0, 50, 200)
-        np.testing.assert_array_equal(retrieval.window_starts(users, days, 183), notebook["window_starts"](users, days, 183))
-        first = retrieval.window_starts(users, days, 183)
+        np.testing.assert_array_equal(inference.window_starts(users, days, 183), notebook["window_starts"](users, days, 183))
+        first = inference.window_starts(users, days, 183)
         starts = np.searchsorted(users, users)
         ends = np.arange(1, 201)
         mu = rng.normal(size=200)
-        for ours, theirs in zip(retrieval.history_windows(ends, starts, mu, first, recipe_idx, ratings, 4, 5),
+        for ours, theirs in zip(inference.history_windows(ends, starts, mu, first, recipe_idx, ratings, 4, 5),
                                 notebook["history_windows"](ends, starts, mu, first, recipe_idx, ratings, 4, 5)):
             np.testing.assert_array_equal(ours, theirs)
 
@@ -302,7 +310,7 @@ class RetrievalPipelineTests(unittest.TestCase):
         tokens = torch.randint(1, 20, (10, 6))
         trained = notebook["GRUCrossAttentionReranker"](tokens, torch.randint(1, 4, (10, 6)), torch.randn(10, 8), 20,
                                                         8, SimpleNamespace(**config)).eval()
-        served = retrieval.WindowGRUCrossAttentionReranker(20, 8, 8, 3, config).eval()
+        served = inference.WindowGRUCrossAttentionReranker(20, 8, 8, 3, config).eval()
         served.load_state_dict(trained.state_dict())  # Same parameter names and shapes.
         history_idx = torch.tensor([[[1, 2, 3], [4, -1, -1]], [[5, 6, -1], [-1, -1, -1]]])
         rating = torch.randn(2, 2, 3) * (history_idx >= 0)
