@@ -18,7 +18,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import model_inference_reranker_avgemb_approach as inference  # noqa: E402
+import model_inference_reranker_avgemb as inference  # noqa: E402
 import model_inference_score_recommend as retrieval  # noqa: E402
 
 PRODUCTS = ["chicken breast", "salmon", "quinoa", "broccoli", "waffle", "chocolate", "lentil", "rice", "apple",
@@ -180,7 +180,8 @@ class RetrievalPipelineTests(unittest.TestCase):
 
     def test_recommend_reranks_the_retrieved_candidates_like_the_inference_script(self):
         user = {"user_id": "u1", "history": self.history()}
-        results = self.pipeline.recommend(user, n_candidates=12, top_k=5)
+        results = self.pipeline.recommend(user, n_candidates=12, top_k=5, mmr_lambda=1.0,
+                                          max_similarity=None)  # P(like) order.
         history, history_emb = self.pipeline.resolve_history(user["history"])
         retrieved = self.pipeline.recipe_index.search(self.pipeline.user_embedding(history_emb).numpy(), 12,
                                                       exclude=[3, 11, 25, 30])
@@ -196,6 +197,71 @@ class RetrievalPipelineTests(unittest.TestCase):
         np.testing.assert_allclose([result["p_like"] for result in results], direct.numpy(), atol=1e-5)
         top = max(results, key=lambda result: result["p_like"])
         self.assertEqual(top["similarity"], dict(retrieved)[top["fdc_id"] - 100000])
+        self.assertEqual([result["rerank_rank"] for result in results], [1, 2, 3, 4, 5])
+
+    def test_recommend_picks_from_the_reranked_candidates_with_mmr(self):
+        user = {"user_id": "u1", "history": self.history()}
+        reranked = self.pipeline.recommend(user, n_candidates=12, top_k=12, mmr_lambda=1.0, max_similarity=None)
+        results = self.pipeline.recommend(user, n_candidates=12, top_k=5, mmr_lambda=0.3)  # Cutoff 0.97.
+        emb = self.pipeline.recipe_index.embeddings[[result["fdc_id"] - 100000 for result in reranked]]
+        unit = emb / np.linalg.norm(emb, axis=1, keepdims=True)
+        cosine = unit @ unit.T
+        picked = retrieval.mmr([result["p_like"] for result in reranked], cosine, 5, 0.3, 0.97)
+        self.assertEqual([result["fdc_id"] for result in results], [reranked[i]["fdc_id"] for i in picked])
+        self.assertEqual(results[0]["fdc_id"], reranked[0]["fdc_id"])  # The first pick is the most likely.
+        self.assertEqual([result["rerank_rank"] for result in results], [i + 1 for i in picked])
+        self.assertLess(cosine[np.ix_(picked, picked)][np.triu_indices(len(picked), 1)].max(), 0.97)
+        # A cutoff below the lowest cosine between candidates leaves every one of them too close to the first pick.
+        lowest = cosine.min() - 1e-4
+        self.assertEqual(len(self.pipeline.recommend(user, n_candidates=12, top_k=5, max_similarity=lowest)), 1)
+
+    # Maximal marginal relevance ------------------------------------------------------------------------
+
+    def test_mmr_with_lambda_one_and_no_cutoff_is_the_order_of_relevance(self):
+        relevance, same = [0.2, 0.9, 0.5, 0.9, 0.1], np.ones((5, 5))
+        self.assertEqual(retrieval.mmr(relevance, same, 5, 1.0, None), [1, 3, 2, 0, 4])  # Ties in input order.
+        self.assertEqual(retrieval.mmr(relevance, same, 9, 1.0, None), [1, 3, 2, 0, 4])
+        self.assertEqual(retrieval.mmr(relevance, same, 0, 1.0, None), [])
+        with self.assertRaises(ValueError):
+            retrieval.mmr(relevance, same, 3, 7)
+
+    def test_mmr_passes_over_a_near_duplicate_of_a_pick(self):
+        # 1 is nearly a copy of 0; 2 is less likely but different.
+        relevance = [0.9, 0.89, 0.7]
+        similarity = np.array([[1.0, 0.99, 0.2], [0.99, 1.0, 0.2], [0.2, 0.2, 1.0]])
+        self.assertEqual(retrieval.mmr(relevance, similarity, 2, 0.5, None), [0, 2])
+        self.assertEqual(retrieval.mmr(relevance, similarity, 2, 1.0, None), [0, 1])
+
+    def test_mmr_never_picks_an_item_at_the_cutoff_or_above_even_if_fewer_than_k_remain(self):
+        relevance = [0.9, 0.89, 0.7, 0.6]
+        similarity = np.array([[1.0, 0.99, 0.2, 0.97],
+                               [0.99, 1.0, 0.2, 0.5],
+                               [0.2, 0.2, 1.0, 0.1],
+                               [0.97, 0.5, 0.1, 1.0]])
+        self.assertEqual(retrieval.mmr(relevance, similarity, 4, 1.0, 0.97), [0, 2])  # 1 and 3 too close to 0.
+        self.assertEqual(retrieval.mmr(relevance, similarity, 4, 1.0, 0.98), [0, 2, 3])  # 0.97 is below 0.98.
+        self.assertEqual(retrieval.mmr(relevance, similarity, 4, 1.0, None), [0, 1, 2, 3])
+
+    def test_each_mmr_pick_maximizes_the_marginal_relevance_among_items_below_the_cutoff(self):
+        rng = np.random.default_rng(2)
+        emb = rng.normal(size=(30, 8))
+        unit = emb / np.linalg.norm(emb, axis=1, keepdims=True)
+        similarity, relevance = unit @ unit.T, rng.uniform(size=30)
+        for cutoff, count in [(None, 10), (0.6, None)]:
+            picked = retrieval.mmr(relevance, similarity, 10, 0.6, cutoff)
+            self.assertEqual(len(set(picked)), len(picked))
+            if count:
+                self.assertEqual(len(picked), count)
+            for step in range(len(picked) + 1):
+                # Similarities can be negative: the penalty is the highest one, not clipped at 0.
+                penalty = similarity[:, picked[:step]].max(axis=1) if step else np.zeros(30)
+                allowed = [i for i in range(30) if i not in picked[:step]
+                           and (cutoff is None or not step or penalty[i] < cutoff)]
+                if step == len(picked):
+                    self.assertTrue(len(picked) == 10 or not allowed)  # Stopped early only when none was allowed.
+                else:
+                    score = 0.6 * relevance - 0.4 * penalty
+                    self.assertEqual(picked[step], max(allowed, key=lambda i: score[i]))
 
     def test_off_catalog_history_recipes_are_encoded(self):
         recipe = {"name": "home made salmon rice", "date": "2024-01-01", "rating": 5, "price": 12.0,

@@ -8,6 +8,10 @@
 4. User state: the history is cut into windows wherever two ratings are window_gap_days (about 6 months) or more
    apart; the GRU runs over each window from a fresh state, and each window's final hidden state is stored.
 5. Reranking: each candidate attends over [user profile; window states] and gets P(like); candidates are sorted by it.
+6. Diversity: maximal marginal relevance (MMR) picks the top_k from the reranked candidates, each pick maximizing
+   lambda * P(like) - (1 - lambda) * its highest cosine similarity to an earlier pick, so near-identical recipes (the
+   catalog has many, e.g. the same food as patties and as crumbles) do not fill the list. A candidate whose cosine to
+   a pick is MMR_MAX_SIMILARITY or more is never picked, so the list can be shorter than top_k.
 
 Usage:
     python model_inference_score_recommend.py build --catalog path/to/price_mapped_nutrients.csv
@@ -43,6 +47,12 @@ CATALOG_NUTRIENTS = {"calories_kcal": "energy_kcal", "fat_g": "fat_g", "sugar_g"
 HNSW_M = 16
 HNSW_EF_CONSTRUCTION = 200
 HNSW_EF_SEARCH = 200
+# P(like) weight in MMR, 1 - MMR_LAMBDA the diversity weight. Candidates are all near the user embedding (cosine 0.8 to
+# 1 among them), and without the cutoff below, at 0.6 or more exact duplicates of the catalog still reach the example
+# users' top 10.
+MMR_LAMBDA = 0.5
+# A candidate this close (cosine) to a pick is never picked, whatever its P(like).
+MMR_MAX_SIMILARITY = 0.97
 SEED = 42
 
 
@@ -337,8 +347,31 @@ class RecipeIndex:
                 if row not in exclude][:k]
 
 
+def mmr(relevance, similarity, k, lambda_=MMR_LAMBDA, max_similarity=MMR_MAX_SIMILARITY):
+    """Maximal marginal relevance: positions of up to k items, in the order they are picked.
+
+    Each pick is the item maximizing lambda_ * relevance - (1 - lambda_) * its highest similarity to an item already
+    picked; similarity is (N, N). lambda_ = 1 keeps the order of relevance (ties in input order), lower values trade
+    relevance for diversity. An item whose similarity to a pick is max_similarity or more is never picked (None: no
+    cutoff), so fewer than k come back when every other item is that close to a pick."""
+    if not 0 <= lambda_ <= 1:
+        raise ValueError(f"The MMR lambda must be between 0 and 1, not {lambda_}.")
+    relevance, similarity = np.asarray(relevance, dtype=np.float64), np.asarray(similarity, dtype=np.float64)
+    closest = np.zeros(len(relevance))  # Highest similarity to a pick; no penalty before the first pick.
+    available = np.ones(len(relevance), dtype=bool)
+    picked = []
+    while len(picked) < k and available.any():
+        score = np.where(available, lambda_ * relevance - (1 - lambda_) * closest, -np.inf)
+        picked.append(int(np.argmax(score)))
+        available[picked[-1]] = False
+        if max_similarity is not None:
+            available &= similarity[picked[-1]] < max_similarity
+        closest = similarity[picked[-1]] if len(picked) == 1 else np.maximum(closest, similarity[picked[-1]])
+    return picked
+
+
 class RetrievalPipeline:
-    """User profile → HNSW candidates → reranked recommendations."""
+    """User profile → HNSW candidates → reranked → diversified (MMR) recommendations."""
 
     def __init__(self, reranker, recipes, recipe_index):
         if [recipe["fdc_id"] for recipe in recipes] != recipe_index.fdc_ids:
@@ -404,11 +437,15 @@ class RetrievalPipeline:
         recipe weighs the same under cosine similarity."""
         return F.normalize(history_emb, dim=1).mean(0)
 
-    def recommend(self, user, n_candidates=100, top_k=10, log=None, show=20):
-        """The top_k of n_candidates retrieved recipes by P(like), most likely first.
+    def recommend(self, user, n_candidates=100, top_k=10, mmr_lambda=MMR_LAMBDA, max_similarity=MMR_MAX_SIMILARITY,
+                  log=None, show=20):
+        """Up to top_k of n_candidates retrieved recipes, picked by MMR over P(like) and the cosine similarity of their
+        item embeddings, in pick order. A candidate whose cosine to a pick is max_similarity or more is left out, so
+        fewer than top_k come back when every other candidate is that close to a pick. mmr_lambda = 1 with
+        max_similarity = None gives the top_k by P(like), most likely first.
 
         With log (e.g. print), each step is reported: the history, the user embedding, the HNSW candidates (the first
-        `show` of them) and how the reranker reorders them."""
+        `show` of them), how the reranker reorders them and what MMR picks."""
         log = log or (lambda *_: None)
         if not user.get("history"):
             raise ValueError("The pipeline needs at least one recipe in the user's history.")
@@ -467,12 +504,15 @@ class RetrievalPipeline:
                     + " ".join(f"{value:+.2f}" for value in window["state"][:6]))
 
         rows = [row for row, _ in candidates]
-        p_likes = self.reranker.score(history, history_emb, torch.from_numpy(self.recipe_index.embeddings[rows]))
+        candidate_emb = torch.from_numpy(self.recipe_index.embeddings[rows])
+        p_likes = self.reranker.score(history, history_emb, candidate_emb)
         results = [{"fdc_id": self.recipes[row]["fdc_id"], "name": self.recipes[row]["name"],
                     "price": self.recipes[row]["price"], "p_like": p_like, "like": p_like >= THRESHOLD,
                     "similarity": similarity, "retrieval_rank": rank}
                    for rank, ((row, similarity), p_like) in enumerate(zip(candidates, p_likes.tolist()), start=1)]
         reranked = sorted(results, key=lambda result: -result["p_like"])
+        for rank, result in enumerate(reranked, start=1):
+            result["rerank_rank"] = rank
 
         keys = (f"the hidden states of {len(self.user_states[user.get('user_id')]['windows'])} windows"
                 if self.reranker.windowed else f"GRU states of the last {min(len(history), t_max)} history recipes")
@@ -484,17 +524,39 @@ class RetrievalPipeline:
                 f"{result['name'][:48]:<48} {result['similarity']:>7.3f} {result['p_like']:>8.4f}")
         if len(reranked) > show:
             log(f"  ... {len(reranked) - show} more")
-        log(f"\n=== Step 6. Top {min(top_k, len(reranked))} kept; {sum(r['like'] for r in reranked)} of "
-            f"{len(reranked)} candidates have P(like) >= {THRESHOLD} ===")
-        return reranked[:top_k]
+
+        unit = F.normalize(candidate_emb, dim=1)
+        cosine = (unit @ unit.T).numpy()  # Candidates in retrieval order, like results.
+        picked = mmr(p_likes.numpy(), cosine, top_k, mmr_lambda, max_similarity)
+        recommended = [results[position] for position in picked]
+        cutoff = "" if max_similarity is None else f"; none at cosine >= {max_similarity:g} to a pick"
+        log(f"\n=== Step 6. MMR: each pick maximizes {mmr_lambda:g} * P(like) - {1 - mmr_lambda:g} * its highest cosine "
+            f"to an earlier pick{cutoff} ===")
+        log(f"  {'pick':>4} {'was':>4}  {'fdc_id':>8}  {'recipe':<48} {'P(like)':>8} {'closest':>7}")
+        for pick, (position, result) in enumerate(zip(picked, recommended), start=1):
+            closest = f"{cosine[position, picked[:pick - 1]].max():.3f}" if pick > 1 else "-"
+            log(f"  {pick:>4} {result['rerank_rank']:>4}  {result['fdc_id']:>8}  {result['name'][:48]:<48} "
+                f"{result['p_like']:>8.4f} {closest:>7}")
+        replaced = sum(result["rerank_rank"] > len(recommended) for result in recommended)
+        if max_similarity is None:
+            cutoff = ""
+        else:
+            too_close = (cosine[:, picked] >= max_similarity).any(axis=1)
+            too_close[picked] = False
+            cutoff = f"; {int(too_close.sum())} candidates left out at cosine >= {max_similarity:g} to a pick"
+        log(f"\n=== Step 7. {len(recommended)} of {top_k} kept, {replaced} of them from beyond the reranker's top "
+            f"{len(recommended)}{cutoff}; {sum(r['like'] for r in reranked)} of {len(reranked)} candidates have "
+            f"P(like) >= {THRESHOLD} ===")
+        return recommended
 
 
 def print_recommendations(user, results):
     print(f"\nRecommendations for user {user.get('user_id', '?')}: {len(user['history'])} history recipes")
-    print(f"  {'fdc_id':>8}  {'recipe':<60} {'P(like)':>8} {'cosine':>7} {'retrieved':>9}")
+    print(f"  {'fdc_id':>8}  {'recipe':<60} {'P(like)':>8} {'cosine':>7} {'retrieved':>9} {'reranked':>8}")
     for result in results:
         print(f"  {result['fdc_id']:>8}  {result['name'][:60]:<60} {result['p_like']:>8.4f} "
-              f"{result['similarity']:>7.3f} {'#' + str(result['retrieval_rank']):>9}")
+              f"{result['similarity']:>7.3f} {'#' + str(result['retrieval_rank']):>9} "
+              f"{'#' + str(result['rerank_rank']):>8}")
 
 
 def main():
@@ -510,6 +572,10 @@ def main():
                         help='JSON user profile {"user_id", "history": [{"fdc_id", "rating", "date"}, ...]}')
     parser.add_argument("--candidates", type=int, default=100, help="recipes retrieved by HNSW")
     parser.add_argument("--top-k", type=int, default=10, help="recommendations kept after reranking")
+    parser.add_argument("--mmr-lambda", type=float, default=MMR_LAMBDA,
+                        help="MMR weight of P(like) against diversity, in [0, 1]; 1 keeps the reranker's order")
+    parser.add_argument("--max-similarity", type=float, default=MMR_MAX_SIMILARITY,
+                        help="a candidate whose cosine to a recommendation is this or more is left out; 2 turns it off")
     parser.add_argument("--output", type=Path, help="also write the recommendations to this JSON file")
     parser.add_argument("--quiet", action="store_true", help="print only the final recommendations, not each step")
     parser.add_argument("--show", type=int, default=20, help="rows printed per step")
@@ -522,8 +588,8 @@ def main():
               f"in {args.index_dir}")
         return
     user = json.loads(args.user.read_text())
-    results = pipeline.recommend(user, args.candidates, args.top_k, log=None if args.quiet else print,
-                                 show=args.show)
+    results = pipeline.recommend(user, args.candidates, args.top_k, args.mmr_lambda, args.max_similarity,
+                                 log=None if args.quiet else print, show=args.show)
     print_recommendations(user, results)
     if args.output:
         windows = pipeline.user_states.get(user.get("user_id"), {}).get("windows", [])
