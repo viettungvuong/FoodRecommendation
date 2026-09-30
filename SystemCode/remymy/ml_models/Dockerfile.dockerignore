@@ -1,0 +1,7 @@
+*
+!DataMappingRecommendation/model_inference_reranker_avgemb.py
+!DataMappingRecommendation/model_inference_score_recommend.py
+!DataMappingRecommendation/model_artifacts/gru_xattn_reranker/model.pt
+!DataMappingRecommendation/model_artifacts/gru_xattn_reranker/config.json
+!SystemCode/remymy/ml_models/requirements-serve.txt
+!SystemCode/remymy/ml_models/serve.py

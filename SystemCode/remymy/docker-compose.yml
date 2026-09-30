@@ -1,0 +1,101 @@
+name: remymy
+
+services:
+  api-migrate:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: remymy-api:dev
+    restart: "no"
+    environment:
+      ENV: ${ENV:-nonprod}
+      DATABASE_PATH: /data/remymy-food.db
+      PYTHONPATH: /opt/remymy-api/migrations:/opt/remymy-api/src
+      RECIPES_SOURCE: ${RECIPES_SOURCE:-}
+      FDC_SOURCE_DIR: ${FDC_SOURCE_DIR:-}
+      FDC_RELEASE: ${FDC_RELEASE:-unspecified}
+    volumes:
+      - "${DATA_DIR:-./data}:/data"
+    command: ["python", "-m", "migrations.bootstrap"]
+    networks:
+      - remymy
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: remymy-api:dev
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8002}:8002"
+    environment:
+      ENV: ${ENV:-nonprod}
+      HOST: 0.0.0.0
+      PORT: 8002
+      DATABASE_PATH: /data/remymy-food.db
+      USER_DATABASE_PATH: /state/remymy-users.db
+      REDIS_URL: redis://redis:6379/0
+      SEED_DEMO_USER: ${SEED_DEMO_USER:-true}
+    depends_on:
+      api-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - "${DATA_DIR:-./data}:/data:ro"
+      - remymy-user-data:/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    networks:
+      - remymy
+
+  ml-models:
+    build:
+      context: ../..
+      dockerfile: SystemCode/remymy/ml_models/Dockerfile
+    image: remymy-ml-models:dev
+    restart: unless-stopped
+    ports:
+      - "${ML_MODELS_PORT:-8003}:8003"
+    environment:
+      ENV: ${ENV:-nonprod}
+      HOST: 0.0.0.0
+      PORT: 8003
+      CATALOG_PATH: /catalog/price_mapped_nutrients.csv
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - "${CATALOG_FILE:-../../DataMappingRecommendation/input_stage2/price_mapped_nutrients.csv}:/catalog/price_mapped_nutrients.csv:ro"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 120s
+      retries: 5
+    networks:
+      - remymy
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - remymy
+
+networks:
+  remymy:
+    driver: bridge
+
+volumes:
+  remymy-user-data:

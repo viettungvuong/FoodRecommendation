@@ -1,0 +1,19 @@
+digraph G {
+  rankdir=TB;
+  graph [fontname="Liberation Sans", bgcolor="white", nodesep=0.35, ranksep=0.38, pad=0.15, splines=ortho];
+  node  [shape=box, style="filled,rounded", fillcolor="#e8eefb", color="#8c9ac0", fontname="Liberation Sans", fontsize=12, penwidth=1.1, margin="0.14,0.07", fontcolor="#1d2433"];
+  edge  [color="#55627a", arrowsize=0.6, penwidth=1.0, fontname="Liberation Sans", fontsize=10, fontcolor="#55627a"];
+  t1 [label="Recipe tokens\n(product / adj / verb)", fillcolor="#f4f5f7", color="#b3b7c0"];
+  n1 [label="Price + nutrients", fillcolor="#f4f5f7", color="#b3b7c0"];
+  t2 [label="Token + field\nembeddings"];
+  t3 [label="Transformer self-attention\n(no positional encoding)"];
+  t4 [label="Mean pool over\nreal tokens → text_emb"];
+  n2 [label="log + z-score"];
+  n3 [label="Linear → num_emb"];
+  f1 [label="Concat → Linear"];
+  f2 [label="item_emb", fillcolor="#dff3ea", color="#7fb59c"];
+  {rank=same; t1; n1;}
+  {rank=same; t2; n2;}
+  {rank=same; t3; n3;}
+  t1 -> t2 -> t3 -> t4 -> f1; n1 -> n2 -> n3 -> f1; f1 -> f2;
+}

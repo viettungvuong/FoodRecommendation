@@ -1,0 +1,12 @@
+digraph G {
+  rankdir=LR;
+  graph [fontname="Liberation Sans", bgcolor="white", nodesep=0.35, ranksep=0.38, pad=0.15, splines=ortho];
+  node  [shape=box, style="filled,rounded", fillcolor="#e8eefb", color="#8c9ac0", fontname="Liberation Sans", fontsize=12, penwidth=1.1, margin="0.14,0.07", fontcolor="#1d2433"];
+  edge  [color="#55627a", arrowsize=0.6, penwidth=1.0, fontname="Liberation Sans", fontsize=10, fontcolor="#55627a"];
+  a [label="Ratings\nbefore t", fillcolor="#f4f5f7", color="#b3b7c0"];
+  b [label="Mean log price +\nmean log nutrients"];
+  c [label="Standardize"];
+  e [label="Two-layer\nMLP"];
+  f [label="U_profile", fillcolor="#dff3ea", color="#7fb59c"];
+  a -> b -> c -> e -> f;
+}
